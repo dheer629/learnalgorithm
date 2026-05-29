@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "vitest"
+    "test": "vitest run"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.11",
@@ -37,4 +37,3 @@
     "vitest": "^2.1.8"
   }
 }
-

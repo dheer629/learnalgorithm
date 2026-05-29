@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CategoryOut(BaseModel):
@@ -30,13 +30,13 @@ class AlgorithmDetailOut(AlgorithmListOut):
     functions: list[dict]
     doctests: list[str]
     complexity: dict
-    related: list[AlgorithmListOut] = []
+    related: list[AlgorithmListOut] = Field(default_factory=list)
 
 
 class ExecuteRequest(BaseModel):
     code: str
     stdin: str = ""
-    args: list[str] = []
+    args: list[str] = Field(default_factory=list)
 
 
 class ExecuteResponse(BaseModel):

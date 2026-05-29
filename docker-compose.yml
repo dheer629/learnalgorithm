@@ -44,18 +44,20 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      context: .
+      dockerfile: frontend/Dockerfile
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000/api
       SERVER_API_URL: http://backend:8000/api
     ports:
       - "3000:3000"
     volumes:
-      - ./frontend:/app
+      - ./frontend:/app/frontend
       - /app/node_modules
+      - /app/frontend/node_modules
     depends_on:
       - backend
-    command: npm run dev
+    command: npm --workspace frontend run dev
 
 volumes:
   postgres-data:
