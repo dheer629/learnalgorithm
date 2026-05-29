@@ -65,4 +65,3 @@ def downgrade() -> None:
     op.drop_table("user_progress")
     op.drop_table("algorithms")
     op.drop_table("categories")
-

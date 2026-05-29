@@ -44,4 +44,3 @@ class ExecuteResponse(BaseModel):
     stderr: str
     output: str
     execution_time_ms: int | None = None
-

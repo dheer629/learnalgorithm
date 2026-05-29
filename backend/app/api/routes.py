@@ -33,8 +33,7 @@ async def categories(db: AsyncSession = Depends(get_db)) -> list[CategoryOut]:
     )
     rows = (await db.execute(query)).all()
     return [
-        CategoryOut.model_validate(category).model_copy(update={"algorithm_count": count})
-        for category, count in rows
+        CategoryOut.model_validate(category).model_copy(update={"algorithm_count": count}) for category, count in rows
     ]
 
 
@@ -58,11 +57,7 @@ async def algorithms(
 @router.get("/algorithms/{slug:path}", response_model=AlgorithmDetailOut)
 async def algorithm(slug: str, db: AsyncSession = Depends(get_db)) -> AlgorithmDetailOut:
     row = (
-        await db.execute(
-            select(Algorithm, Category.slug)
-            .join(Category)
-            .where(Algorithm.slug == slug)
-        )
+        await db.execute(select(Algorithm, Category.slug).join(Category).where(Algorithm.slug == slug))
     ).one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Algorithm not found")

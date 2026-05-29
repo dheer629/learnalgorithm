@@ -41,4 +41,3 @@ class Algorithm(Base):
 
 
 Index("ix_algorithms_search_vector", Algorithm.search_vector, postgresql_using="gin")
-

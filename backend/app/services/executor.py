@@ -41,4 +41,3 @@ async def execute_python(payload: ExecuteRequest) -> ExecuteResponse:
         output=result.get("output", ""),
         execution_time_ms=elapsed,
     )
-

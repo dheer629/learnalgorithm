@@ -1,6 +1,14 @@
 [tool.black]
 line-length = 120
 target-version = ["py312"]
+extend-exclude = '''
+/(
+  \.pytest_cache
+  | \.pytest_cache_local
+  | \.pytest_tmp
+  | \.ruff_cache
+)/
+'''
 
 [tool.ruff]
 line-length = 120

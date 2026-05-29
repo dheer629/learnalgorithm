@@ -17,4 +17,3 @@ class UserProgress(Base):
     algorithm_id: Mapped[str] = mapped_column(ForeignKey("algorithms.id"))
     state: Mapped[str] = mapped_column(String(40), default="viewed")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-

@@ -9,9 +9,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Algorithm Learn API"
     environment: str = "development"
-    database_url: str = Field(
-        default="postgresql+asyncpg://algolearn:algolearn@localhost:5432/algolearn"
-    )
+    database_url: str = Field(default="postgresql+asyncpg://algolearn:algolearn@localhost:5432/algolearn")
     redis_url: str = "redis://localhost:6379/0"
     frontend_origin: str = "http://localhost:3000"
     sentry_dsn: str | None = None
@@ -22,4 +20,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
