@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+node_modules
+frontend/node_modules
+frontend/.next
+backend/.pytest_cache
+backend/.pytest_cache_local
+backend/.pytest_tmp
+backend/.ruff_cache
+__pycache__
+*.pyc
+.env
+

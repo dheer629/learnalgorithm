@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: algolearn
+      POSTGRES_PASSWORD: algolearn
+      POSTGRES_DB: algolearn
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U algolearn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://algolearn:algolearn@postgres:5432/algolearn
+      REDIS_URL: redis://redis:6379/0
+      FRONTEND_ORIGIN: http://localhost:3000
+      PISTON_URL: https://emkc.org/api/v2/piston/execute
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - upstream-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      SERVER_API_URL: http://backend:8000/api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    command: npm run dev
+
+volumes:
+  postgres-data:
+  upstream-data:
