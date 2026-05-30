@@ -33,6 +33,11 @@ class AlgorithmExampleOut(BaseModel):
     matched: bool | None = None
     status: str
     validation_error: str | None = None
+    execution_time_ms: int | None = None
+    runner: str | None = None
+    python_version: str | None = None
+    exit_code: int | None = None
+    logs: list[str] = Field(default_factory=list)
 
 
 class AlgorithmDetailOut(AlgorithmListOut):
@@ -57,4 +62,8 @@ class ExecuteResponse(BaseModel):
     stderr: str
     output: str
     execution_time_ms: int | None = None
-
+    status: str = "completed"
+    runner: str = "unknown"
+    python_version: str | None = None
+    exit_code: int | None = None
+    logs: list[str] = Field(default_factory=list)

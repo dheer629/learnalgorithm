@@ -19,7 +19,12 @@ export default async function AlgorithmPage({ params }: { params: { slug: string
     actualOutput: example.actual_output,
     matched: example.matched,
     status: example.status,
-    validationError: example.validation_error
+    validationError: example.validation_error,
+    executionTimeMs: example.execution_time_ms,
+    runner: example.runner,
+    pythonVersion: example.python_version,
+    exitCode: example.exit_code,
+    logs: example.logs
   }));
   return (
     <article className="grid gap-8">

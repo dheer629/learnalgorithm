@@ -37,4 +37,21 @@ export type AlgorithmExample = {
   matched: boolean | null;
   status: "matched" | "not-matched" | "ran" | "blocked" | "failed" | string;
   validation_error?: string | null;
+  execution_time_ms?: number | null;
+  runner?: string | null;
+  python_version?: string | null;
+  exit_code?: number | null;
+  logs: string[];
+};
+
+export type ExecuteResult = {
+  stdout: string;
+  stderr: string;
+  output: string;
+  execution_time_ms: number | null;
+  status: string;
+  runner: string;
+  python_version?: string | null;
+  exit_code?: number | null;
+  logs: string[];
 };

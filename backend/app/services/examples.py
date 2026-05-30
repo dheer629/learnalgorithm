@@ -34,11 +34,13 @@ async def build_validated_examples(source_code: str) -> list[AlgorithmExampleOut
             matched = None
             status = "blocked"
             error = str(exc)
+            result = None
         except Exception as exc:
             actual = ""
             matched = False
             status = "failed"
             error = str(exc)
+            result = None
 
         validated.append(
             AlgorithmExampleOut(
@@ -51,6 +53,11 @@ async def build_validated_examples(source_code: str) -> list[AlgorithmExampleOut
                 matched=matched,
                 status=status,
                 validation_error=error,
+                execution_time_ms=result.execution_time_ms if result else None,
+                runner=result.runner if result else None,
+                python_version=result.python_version if result else None,
+                exit_code=result.exit_code if result else None,
+                logs=result.logs if result else ([error] if error else []),
             )
         )
     return validated
