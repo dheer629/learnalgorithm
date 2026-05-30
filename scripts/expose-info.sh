@@ -15,11 +15,34 @@ stop_forward() {
     local pid
     pid="$(cat "$pid_file")"
     if kill -0 "$pid" >/dev/null 2>&1; then
-      echo "Stopping old $name port-forward ($pid)"
-      kill "$pid" >/dev/null 2>&1 || true
+      if ps -p "$pid" -o args= | grep -q 'kubectl .*port-forward'; then
+        echo "Stopping old $name port-forward ($pid)"
+        kill "$pid" >/dev/null 2>&1 || true
+      else
+        echo "Ignoring stale $name pid file ($pid)"
+      fi
     fi
     rm -f "$pid_file"
   fi
+}
+
+stop_port_users() {
+  local local_port="$1"
+  ps -eo pid=,comm=,args= \
+    | awk -v prefix="${local_port}:" '$2 == "kubectl" {
+        for (i = 3; i <= NF; i++) {
+          if (index($i, prefix) == 1) {
+            print $1
+            break
+          }
+        }
+      }' \
+    | while read -r pid; do
+        if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+          echo "Stopping existing kubectl port-forward on localhost:$local_port ($pid)"
+          kill "$pid" >/dev/null 2>&1 || true
+        fi
+      done
 }
 
 start_forward() {
@@ -28,8 +51,13 @@ start_forward() {
   local local_port="$3"
   local remote_port="$4"
   stop_forward "$name"
+  stop_port_users "$local_port"
   echo "Starting $name port-forward on localhost:$local_port"
-  kubectl -n "$NAMESPACE" port-forward "svc/$service" "$local_port:$remote_port" >"$RUNTIME_DIR/$name.log" 2>&1 &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid kubectl -n "$NAMESPACE" port-forward "svc/$service" "$local_port:$remote_port" >"$RUNTIME_DIR/$name.log" 2>&1 < /dev/null &
+  else
+    nohup kubectl -n "$NAMESPACE" port-forward "svc/$service" "$local_port:$remote_port" >"$RUNTIME_DIR/$name.log" 2>&1 < /dev/null &
+  fi
   echo "$!" >"$RUNTIME_DIR/$name.pid"
 }
 
