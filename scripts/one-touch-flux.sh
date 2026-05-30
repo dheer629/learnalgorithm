@@ -52,6 +52,10 @@ if [ -z "$IMAGE_REGISTRY" ]; then
   printf '{}\n' >"$DOCKER_CONFIG/config.json"
   docker build -t "$BACKEND_IMAGE" "$BUILD_DIR/backend"
   docker build -t "$FRONTEND_IMAGE" -f "$BUILD_DIR/frontend/Dockerfile" "$BUILD_DIR"
+  if docker ps --format '{{.Names}}' | grep -qx 'vcluster.cp.dev'; then
+    echo "Detected vcluster.cp.dev. Importing local images into vCluster containerd..."
+    docker save "$BACKEND_IMAGE" "$FRONTEND_IMAGE" | docker exec -i vcluster.cp.dev ctr -n k8s.io images import -
+  fi
   CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
   if echo "$CONTEXT" | grep -qi kind && command -v kind >/dev/null 2>&1; then
     CLUSTER_NAME="${CONTEXT#kind-}"
@@ -84,6 +88,8 @@ fi
 echo "Reconciling Flux source and application..."
 flux reconcile source git learnalgorithm-repo -n flux-system
 flux reconcile kustomization learnalgorithm-app -n flux-system
+kubectl -n "$NAMESPACE" delete pod -l app=learnalgorithm-backend --ignore-not-found=true
+kubectl -n "$NAMESPACE" delete pod -l app=learnalgorithm-frontend --ignore-not-found=true
 
 echo "Waiting for app resources..."
 kubectl -n "$NAMESPACE" rollout status deploy/redis --timeout=180s
