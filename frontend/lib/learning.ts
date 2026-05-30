@@ -11,6 +11,9 @@ export type LearningGuide = {
   whatItDoes: string;
   whenToUse: string;
   howToRun: string[];
+  commonPitfalls: string[];
+  interviewNotes: string[];
+  realWorldUseCases: string[];
   example: LearningExample | null;
 };
 
@@ -44,6 +47,9 @@ export function buildLearningGuide(algorithm: AlgorithmDetail): LearningGuide {
       "Use the editable Python panel to change the values, then press Run.",
       "Compare the Actual output with Expected output. Matching output means the sample behaved as intended."
     ],
+    commonPitfalls: buildPitfalls(algorithm),
+    interviewNotes: buildInterviewNotes(algorithm),
+    realWorldUseCases: buildUseCases(algorithm),
     example
   };
 }
@@ -65,6 +71,37 @@ function buildWhenToUse(algorithm: AlgorithmDetail) {
   const category = algorithm.category_slug.replaceAll("-", " ");
   const complexity = algorithm.complexity.time ? ` Its annotated time complexity is ${algorithm.complexity.time}.` : "";
   return `Use it when you are solving a ${category} problem with similar inputs or when you want to practice recognizing this pattern.${complexity}`;
+}
+
+function buildPitfalls(algorithm: AlgorithmDetail) {
+  const notes = ["Check input ordering, empty inputs, duplicate values, and boundary indexes before trusting a run."];
+  if (!algorithm.complexity.time && !algorithm.complexity.space) {
+    notes.push("Complexity is not annotated in the source metadata, so inspect loops and recursion depth manually.");
+  }
+  if (algorithm.functions.length > 3) {
+    notes.push("This file has multiple helper functions; trace the primary call path before changing internals.");
+  }
+  return notes;
+}
+
+function buildInterviewNotes(algorithm: AlgorithmDetail) {
+  const primaryFunction = algorithm.functions[0]?.signature;
+  return [
+    primaryFunction ? `Be ready to explain the contract of ${primaryFunction}.` : "Be ready to state the input and output contract.",
+    "Walk through one small example aloud and name the invariant that stays true after each step.",
+    algorithm.complexity.time
+      ? `Mention the extracted time complexity: ${algorithm.complexity.time}.`
+      : "Derive time complexity from the loops, recursion, and data structures in the source."
+  ];
+}
+
+function buildUseCases(algorithm: AlgorithmDetail) {
+  const category = algorithm.category_slug.replaceAll("-", " ");
+  return [
+    `Practice ${category} pattern recognition with executable source.`,
+    "Compare expected and actual output when changing inputs.",
+    "Use trace frames to debug how intermediate values move through the algorithm."
+  ];
 }
 
 function buildExampleCode(sourceCode: string, command: string) {

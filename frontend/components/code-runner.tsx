@@ -1,20 +1,25 @@
 "use client";
 
 import {
-  Activity,
   CheckCircle2,
+  Clipboard,
   Clock3,
-  Cpu,
+  Code2,
+  Copy,
+  Download,
   Loader2,
   Play,
   RotateCcw,
+  Rows3,
   Terminal,
-  TestTube2,
-  Type,
   XCircle
 } from "lucide-react";
-import { useState, useTransition } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
+import type React from "react";
+import { CodeEditor } from "@/components/code-editor";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
 import type { ExecuteResult } from "@/lib/types";
 import { usePreferences } from "@/store/preferences";
@@ -36,7 +41,7 @@ type SampleRun = {
   logs?: string[];
 };
 
-type RunState = "idle" | "loading-sample" | "running" | "completed" | "failed";
+type RunState = "idle" | "running" | "completed" | "failed";
 
 export function CodeRunner({
   sourceCode,
@@ -49,34 +54,51 @@ export function CodeRunner({
 }) {
   const availableSamples = samples.length > 0 ? samples : sample ? [sample] : [];
   const firstSample = availableSamples[0];
-  const [code, setCode] = useState(sourceCode);
-  const [stdin, setStdin] = useState("");
+  const [code, setCode] = useState(firstSample?.code ?? sourceCode);
+  const [stdin, setStdin] = useState(firstSample?.stdin ?? "");
   const [actualOutput, setActualOutput] = useState(firstSample?.actualOutput || "Run the algorithm to see output here.");
   const [expectedOutput, setExpectedOutput] = useState(firstSample?.expectedOutput ?? "");
-  const [matchState, setMatchState] = useState<"idle" | "matched" | "not-matched">(
-    firstSample?.matched === true ? "matched" : firstSample?.matched === false ? "not-matched" : "idle"
-  );
-  const [runState, setRunState] = useState<RunState>(firstSample ? "completed" : "idle");
   const [selectedExample, setSelectedExample] = useState(firstSample?.title ?? "Custom run");
   const [runMeta, setRunMeta] = useState<ExecuteResult | null>(firstSample ? sampleToResult(firstSample) : null);
+  const [runState, setRunState] = useState<RunState>(firstSample ? "completed" : "idle");
+  const [logsOpen, setLogsOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
   const { codeFontSize, setCodeFontSize } = usePreferences();
+  const matchState = compareOutput(actualOutput, expectedOutput);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        runCode();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
 
   function loadSample(nextSample: SampleRun) {
-    setRunState("loading-sample");
     setSelectedExample(nextSample.title ?? "Example");
     setCode(nextSample.code);
     setStdin(nextSample.stdin);
     setExpectedOutput(nextSample.expectedOutput);
-    setActualOutput(nextSample.actualOutput || "Sample loaded. Press Run to execute it in the backend Python runtime.");
+    setActualOutput(nextSample.actualOutput || "Sample loaded. Press Run to execute it.");
     setRunMeta(sampleToResult(nextSample));
-    setMatchState(nextSample.matched === true ? "matched" : nextSample.matched === false ? "not-matched" : "idle");
-    window.setTimeout(() => setRunState(nextSample.actualOutput ? "completed" : "idle"), 250);
+    setRunState(nextSample.actualOutput ? "completed" : "idle");
   }
 
-  function loadAndRunSample(nextSample: SampleRun) {
-    loadSample(nextSample);
-    runCode(nextSample.code, nextSample.stdin, nextSample.expectedOutput, nextSample.title ?? "Example");
+  function resetCode() {
+    if (firstSample) {
+      loadSample(firstSample);
+      return;
+    }
+    setCode(sourceCode);
+    setStdin("");
+    setExpectedOutput("");
+    setActualOutput("Run the algorithm to see output here.");
+    setRunMeta(null);
+    setRunState("idle");
+    setSelectedExample("Custom run");
   }
 
   function runCode(nextCode = code, nextStdin = stdin, nextExpected = expectedOutput, title = selectedExample) {
@@ -87,8 +109,8 @@ export function CodeRunner({
         const result = await api.execute(nextCode, nextStdin);
         const actual = result.output || result.stdout || result.stderr || "Execution finished without output.";
         setActualOutput(actual);
+        setExpectedOutput(nextExpected);
         setRunMeta(result);
-        setMatchState(compareOutput(actual, nextExpected));
         setRunState(result.status === "failed" || result.status === "timeout" ? "failed" : "completed");
       } catch (error) {
         const message = error instanceof Error ? error.message : "Execution failed.";
@@ -104,154 +126,166 @@ export function CodeRunner({
           exit_code: null,
           logs: [message]
         });
-        setMatchState("not-matched");
         setRunState("failed");
       }
     });
   }
 
+  const diff = useMemo(() => buildDiff(expectedOutput, actualOutput), [actualOutput, expectedOutput]);
+
   return (
-    <section className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(520px,0.95fr)]">
-      <div className="glass-panel overflow-hidden border border-border">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
+    <section className="grid gap-4 xl:grid-cols-[minmax(0,1.08fr)_minmax(420px,0.92fr)]">
+      <Card className="overflow-hidden p-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-4">
           <div className="flex items-center gap-3">
-            <span className="grid h-9 w-9 place-items-center bg-primary text-white">
-              <Terminal className="h-4 w-4" aria-hidden />
+            <span className="grid h-10 w-10 place-items-center rounded-md bg-primary text-white">
+              <Terminal className="h-5 w-5" aria-hidden />
             </span>
             <div>
-              <h3 className="text-sm font-semibold">Python Editor</h3>
-              <p className="text-xs text-foreground/60">Runs on the backend Python environment</p>
+              <h3 className="text-base font-semibold">Python Editor</h3>
+              <p className="text-xs text-foreground/60">{selectedExample}</p>
             </div>
           </div>
-          <label className="flex items-center gap-2 text-sm">
-            <Type className="h-4 w-4" aria-hidden />
-            <input
-              aria-label="Code font size"
-              className="w-24 accent-primary"
-              type="range"
-              min="12"
-              max="20"
-              value={codeFontSize}
-              onChange={(event) => setCodeFontSize(Number(event.target.value))}
-            />
-          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 text-sm">
+              <Code2 className="h-4 w-4" aria-hidden />
+              <input
+                aria-label="Code font size"
+                className="w-24 accent-primary"
+                max="20"
+                min="12"
+                type="range"
+                value={codeFontSize}
+                onChange={(event) => setCodeFontSize(Number(event.target.value))}
+              />
+            </label>
+            <IconButton label="Copy code" onClick={() => copyText(code)}>
+              <Copy className="h-4 w-4" aria-hidden />
+            </IconButton>
+            <IconButton label="Download code" onClick={() => downloadCode(code, selectedExample)}>
+              <Download className="h-4 w-4" aria-hidden />
+            </IconButton>
+          </div>
         </div>
-        <textarea
-          aria-label="Algorithm source code"
-          className="h-[690px] w-full resize-none bg-transparent p-5 font-mono leading-6 outline-none"
-          style={{ fontSize: codeFontSize }}
-          spellCheck={false}
+        <CodeEditor
           value={code}
-          onChange={(event) => {
-            setCode(event.target.value);
+          fontSize={codeFontSize}
+          height={680}
+          onChange={(nextCode) => {
+            setCode(nextCode);
             setSelectedExample("Custom run");
             setRunState("idle");
           }}
         />
-      </div>
+      </Card>
 
       <aside className="grid content-start gap-4">
-        <div className="glass-panel grid gap-3 border border-border p-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <Card className="grid gap-4">
+          <CardHeader className="mb-0">
             <div>
-              <h3 className="text-sm font-semibold">Execution Cockpit</h3>
-              <p className="text-xs text-foreground/60">{selectedExample}</p>
+              <CardTitle>Execution Cockpit</CardTitle>
+              <CardDescription>Runs with the backend Python sandbox. Use Ctrl/Cmd + Enter to run.</CardDescription>
             </div>
             <RunBadge state={runState} pending={isPending} />
-          </div>
+          </CardHeader>
           <RuntimePanel result={runMeta} />
-          <div className="grid gap-3 md:grid-cols-[1fr_auto]">
-            <textarea
-              aria-label="Standard input"
-              className="min-h-24 w-full resize-y border border-border bg-background p-3 font-mono text-sm"
-              placeholder="stdin"
-              value={stdin}
-              onChange={(event) => setStdin(event.target.value)}
-            />
-            <div className="grid gap-2 md:w-40">
-              <Button onClick={() => runCode()} disabled={isPending}>
-                {isPending ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />}
-                {isPending ? "Running" : "Run"}
-              </Button>
-              {firstSample && (
-                <Button variant="secondary" onClick={() => loadSample(firstSample)} disabled={isPending}>
-                  <TestTube2 className="h-4 w-4" aria-hidden />
-                  Load
-                </Button>
-              )}
-            </div>
+          <textarea
+            aria-label="Standard input"
+            className="min-h-24 w-full resize-y rounded-md border border-border bg-background p-3 font-mono text-sm"
+            placeholder="stdin"
+            value={stdin}
+            onChange={(event) => setStdin(event.target.value)}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => runCode()} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Play className="h-4 w-4" aria-hidden />}
+              {isPending ? "Running" : "Run"}
+            </Button>
+            <Button variant="secondary" onClick={resetCode} disabled={isPending}>
+              <RotateCcw className="h-4 w-4" aria-hidden />
+              Reset
+            </Button>
+            <Button variant="secondary" onClick={() => setCode(tidyPython(code))} disabled={isPending}>
+              <Rows3 className="h-4 w-4" aria-hidden />
+              Tidy
+            </Button>
           </div>
-        </div>
+        </Card>
 
         {availableSamples.length > 0 && (
-          <div className="glass-panel grid gap-3 border border-border p-4">
-            <div className="flex items-center justify-between gap-3">
-              <h3 className="text-sm font-semibold">Validated Examples</h3>
-              <span className="text-xs text-foreground/60">{availableSamples.length} available</span>
-            </div>
+          <Card className="grid gap-3">
+            <CardHeader className="mb-0">
+              <CardTitle>Runnable Examples</CardTitle>
+              <Badge tone="muted">{availableSamples.length} available</Badge>
+            </CardHeader>
             <div className="grid max-h-72 gap-2 overflow-auto">
               {availableSamples.map((item, index) => (
-                <div key={`${item.title ?? "example"}-${index}`} className="grid gap-2 border border-border bg-background p-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <button className="text-left text-sm font-semibold hover:text-primary" type="button" onClick={() => loadSample(item)}>
-                      {item.title ?? `Example ${index + 1}`}
-                    </button>
+                <button
+                  className="grid gap-2 rounded-md border border-border bg-background p-3 text-left hover:bg-muted"
+                  key={`${item.title ?? "example"}-${index}`}
+                  type="button"
+                  onClick={() => loadSample(item)}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="font-semibold">{item.title ?? `Example ${index + 1}`}</span>
                     <StatusBadge matched={item.matched} status={item.status} />
-                  </div>
+                  </span>
                   {item.command && <code className="break-all text-xs text-foreground/70">{item.command}</code>}
-                  {item.validationError && <span className="text-xs text-accent">{item.validationError}</span>}
-                  <div className="flex gap-2">
-                    <Button className="h-8 px-3" variant="secondary" onClick={() => loadSample(item)} disabled={isPending}>
-                      Load
-                    </Button>
-                    <Button className="h-8 px-3" onClick={() => loadAndRunSample(item)} disabled={isPending}>
-                      Run sample
-                    </Button>
-                  </div>
-                </div>
+                </button>
               ))}
             </div>
-          </div>
+          </Card>
         )}
 
-        <div className="grid gap-4 lg:grid-cols-2">
-          <OutputBox title="Expected output" value={expectedOutput || "No expected output is annotated for this run."} tone="expected" />
-          <OutputBox title="Actual output" value={actualOutput} tone="actual" />
-        </div>
+        <Card className="grid gap-3">
+          <CardHeader className="mb-0">
+            <CardTitle>Expected vs Actual</CardTitle>
+            <MatchBadge state={matchState} />
+          </CardHeader>
+          <div className="grid gap-3 lg:grid-cols-2">
+            <OutputBox title="Expected" value={expectedOutput || "No expected output is annotated."} onCopy={() => copyText(expectedOutput)} />
+            <OutputBox title="Actual" value={actualOutput} onCopy={() => copyText(actualOutput)} />
+          </div>
+          <DiffView rows={diff} />
+        </Card>
 
-        <div className="glass-panel flex items-center gap-2 border border-border p-3 text-sm">
-          {matchState === "matched" && <CheckCircle2 className="h-4 w-4 text-primary" aria-hidden />}
-          {matchState === "not-matched" && <XCircle className="h-4 w-4 text-accent" aria-hidden />}
-          {matchState === "idle" && <RotateCcw className="h-4 w-4 text-foreground/60" aria-hidden />}
-          <span>
-            {matchState === "matched" && "Matched: actual output equals expected output."}
-            {matchState === "not-matched" && "Not matched: inspect stdout, stderr, and logs below."}
-            {matchState === "idle" && "Run code to check whether actual output matches expected output."}
-          </span>
-        </div>
-
-        <ExecutionLogs result={runMeta} />
+        <Card className="grid gap-3">
+          <button
+            className="flex items-center justify-between gap-3 text-left font-semibold"
+            type="button"
+            onClick={() => setLogsOpen((value) => !value)}
+          >
+            <span className="flex items-center gap-2">
+              <Clipboard className="h-4 w-4 text-primary" aria-hidden />
+              Execution logs
+            </span>
+            <Badge tone="muted">{logsOpen ? "open" : "closed"}</Badge>
+          </button>
+          {logsOpen && <ExecutionLogs result={runMeta} />}
+        </Card>
       </aside>
     </section>
   );
 }
 
 function RunBadge({ state, pending }: { state: RunState; pending: boolean }) {
-  const label = pending || state === "running" ? "running" : state.replace("-", " ");
-  return (
-    <span className="inline-flex items-center gap-2 border border-border bg-muted px-3 py-1 text-xs font-semibold uppercase tracking-wide">
-      {pending || state === "running" ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Cpu className="h-3.5 w-3.5" aria-hidden />}
-      {label}
-    </span>
-  );
+  if (pending || state === "running") {
+    return (
+      <Badge tone="warning">
+        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" aria-hidden />
+        running
+      </Badge>
+    );
+  }
+  return <Badge tone={state === "failed" ? "danger" : state === "completed" ? "success" : "muted"}>{state}</Badge>;
 }
 
 function RuntimePanel({ result }: { result: ExecuteResult | null }) {
   return (
     <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
-      <Metric label="Runner" value={result?.runner ?? "local-python"} />
-      <Metric label="Python" value={result?.python_version ?? "backend"} />
-      <Metric label="Exit code" value={result?.exit_code === null || result?.exit_code === undefined ? "pending" : String(result.exit_code)} />
+      <Metric label="Runner" value={result?.runner ?? "pending"} />
+      <Metric label="Python" value={result?.python_version ?? "pending"} />
+      <Metric label="Exit" value={result?.exit_code === null || result?.exit_code === undefined ? "pending" : String(result.exit_code)} />
       <Metric label="Time" value={result?.execution_time_ms ? `${result.execution_time_ms} ms` : "pending"} />
     </div>
   );
@@ -259,45 +293,93 @@ function RuntimePanel({ result }: { result: ExecuteResult | null }) {
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="grid gap-1 border border-border bg-background p-2">
+    <div className="grid gap-1 rounded-md border border-border bg-background p-2">
       <span className="text-foreground/60">{label}</span>
       <span className="truncate font-semibold">{value}</span>
     </div>
   );
 }
 
-function OutputBox({ title, value, tone }: { title: string; value: string; tone: "expected" | "actual" }) {
+function OutputBox({ title, value, onCopy }: { title: string; value: string; onCopy: () => void }) {
   return (
-    <div className="glass-panel grid gap-2 border border-border p-4">
+    <div className="grid gap-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-semibold">{title}</span>
-        <span className={tone === "actual" ? "text-xs font-medium text-primary" : "text-xs font-medium text-foreground/60"}>
-          {tone}
-        </span>
+        <IconButton label={`Copy ${title.toLowerCase()} output`} onClick={onCopy}>
+          <Copy className="h-4 w-4" aria-hidden />
+        </IconButton>
       </div>
-      <pre className="min-h-48 overflow-auto border border-border bg-foreground p-3 text-sm text-background">{value}</pre>
+      <pre className="min-h-40 overflow-auto rounded-md border border-border bg-foreground p-3 text-sm text-background">{value}</pre>
+    </div>
+  );
+}
+
+function DiffView({ rows }: { rows: Array<{ expected: string; actual: string; same: boolean }> }) {
+  if (!rows.length) return null;
+  return (
+    <div className="grid gap-2 rounded-md border border-border bg-background p-3 text-xs">
+      {rows.map((row, index) => (
+        <div className="grid gap-2 md:grid-cols-[1fr_1fr]" key={`${index}-${row.expected}-${row.actual}`}>
+          <code className={row.same ? "text-foreground/70" : "text-accent"}>{row.expected || " "}</code>
+          <code className={row.same ? "text-foreground/70" : "text-accent"}>{row.actual || " "}</code>
+        </div>
+      ))}
     </div>
   );
 }
 
 function ExecutionLogs({ result }: { result: ExecuteResult | null }) {
-  const logs = result?.logs?.length ? result.logs : ["No run logs yet. Press Run to execute the code in the backend Python environment."];
+  const logs = result?.logs?.length ? result.logs : ["No run logs yet."];
   return (
-    <div className="glass-panel grid gap-3 border border-border p-4">
-      <span className="flex items-center gap-2 text-sm font-semibold">
-        <Activity className="h-4 w-4 text-primary" aria-hidden />
-        Execution logs and failure reason
-      </span>
-      <div className="grid max-h-64 gap-2 overflow-auto border border-border bg-muted/50 p-3 text-xs">
-        {logs.map((line, index) => (
-          <div key={`${index}-${line}`} className="flex gap-2">
-            <Clock3 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/50" aria-hidden />
-            <span className="break-words font-mono">{line}</span>
-          </div>
-        ))}
-      </div>
+    <div className="grid max-h-64 gap-2 overflow-auto rounded-md border border-border bg-muted/50 p-3 text-xs">
+      {logs.map((line, index) => (
+        <div key={`${index}-${line}`} className="flex gap-2">
+          <Clock3 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/50" aria-hidden />
+          <span className="break-words font-mono">{line}</span>
+        </div>
+      ))}
     </div>
   );
+}
+
+function IconButton({ children, label, onClick }: { children: React.ReactNode; label: string; onClick: () => void }) {
+  return (
+    <button
+      aria-label={label}
+      className="inline-grid h-9 w-9 place-items-center rounded-md border border-border bg-background hover:bg-muted"
+      type="button"
+      onClick={onClick}
+      title={label}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MatchBadge({ state }: { state: "idle" | "matched" | "not-matched" }) {
+  if (state === "matched") {
+    return (
+      <Badge tone="success">
+        <CheckCircle2 className="mr-1 h-3.5 w-3.5" aria-hidden />
+        matched
+      </Badge>
+    );
+  }
+  if (state === "not-matched") {
+    return (
+      <Badge tone="danger">
+        <XCircle className="mr-1 h-3.5 w-3.5" aria-hidden />
+        diff
+      </Badge>
+    );
+  }
+  return <Badge tone="muted">ready</Badge>;
+}
+
+function StatusBadge({ matched, status }: { matched?: boolean | null; status?: string }) {
+  if (matched === true) return <Badge tone="success">matched</Badge>;
+  if (matched === false) return <Badge tone="danger">not matched</Badge>;
+  return <Badge tone="muted">{status ?? "ready"}</Badge>;
 }
 
 function sampleToResult(sample: SampleRun): ExecuteResult {
@@ -314,17 +396,46 @@ function sampleToResult(sample: SampleRun): ExecuteResult {
   };
 }
 
-function StatusBadge({ matched, status }: { matched?: boolean | null; status?: string }) {
-  if (matched === true) return <span className="text-xs font-semibold text-primary">matched</span>;
-  if (matched === false) return <span className="text-xs font-semibold text-accent">not matched</span>;
-  return <span className="text-xs font-semibold text-foreground/60">{status ?? "ready"}</span>;
-}
-
 function compareOutput(actual: string, expected: string): "idle" | "matched" | "not-matched" {
   if (!expected.trim()) return "idle";
   return normalize(actual) === normalize(expected) ? "matched" : "not-matched";
 }
 
+function buildDiff(expected: string, actual: string) {
+  if (!expected.trim()) return [];
+  const expectedLines = normalize(expected).split("\n");
+  const actualLines = normalize(actual).split("\n");
+  const total = Math.max(expectedLines.length, actualLines.length);
+  return Array.from({ length: total }).map((_, index) => ({
+    expected: expectedLines[index] ?? "",
+    actual: actualLines[index] ?? "",
+    same: (expectedLines[index] ?? "") === (actualLines[index] ?? "")
+  }));
+}
+
 function normalize(value: string) {
   return value.replace(/\r/g, "").trim();
+}
+
+function tidyPython(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+$/g, ""))
+    .join("\n")
+    .trimEnd()
+    .concat("\n");
+}
+
+async function copyText(value: string) {
+  await navigator.clipboard?.writeText(value);
+}
+
+function downloadCode(value: string, title: string) {
+  const blob = new Blob([value], { type: "text/x-python" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "algorithm"}.py`;
+  link.click();
+  URL.revokeObjectURL(url);
 }

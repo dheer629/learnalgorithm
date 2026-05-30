@@ -1,4 +1,4 @@
-import type { AlgorithmDetail, AlgorithmSummary, Category, ExecuteResult, VisualizeResult } from "@/lib/types";
+import type { AlgorithmDetail, AlgorithmSearchResult, AlgorithmSummary, Category, ExecuteResult, VisualizeResult } from "@/lib/types";
 
 const BROWSER_API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
 const SERVER_API_URL = process.env.SERVER_API_URL ?? BROWSER_API_URL;
@@ -30,11 +30,43 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   categories: () => fetchJson<Category[]>("/categories"),
-  algorithms: (params?: { category?: string; q?: string }) => {
+  algorithms: (params?: {
+    category?: string;
+    q?: string;
+    difficulty?: string;
+    tags?: string;
+    sort?: string;
+    page?: number;
+    pageSize?: number;
+  }) => {
     const query = new URLSearchParams();
     if (params?.category) query.set("category", params.category);
     if (params?.q) query.set("q", params.q);
+    if (params?.difficulty) query.set("difficulty", params.difficulty);
+    if (params?.tags) query.set("tags", params.tags);
+    if (params?.sort) query.set("sort", params.sort);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.pageSize) query.set("page_size", String(params.pageSize));
     return fetchJson<AlgorithmSummary[]>(`/algorithms?${query.toString()}`);
+  },
+  algorithmSearch: (params?: {
+    category?: string;
+    q?: string;
+    difficulty?: string;
+    tags?: string;
+    sort?: string;
+    page?: number;
+    pageSize?: number;
+  }) => {
+    const query = new URLSearchParams({ meta: "true" });
+    if (params?.category) query.set("category", params.category);
+    if (params?.q) query.set("q", params.q);
+    if (params?.difficulty) query.set("difficulty", params.difficulty);
+    if (params?.tags) query.set("tags", params.tags);
+    if (params?.sort) query.set("sort", params.sort);
+    if (params?.page) query.set("page", String(params.page));
+    if (params?.pageSize) query.set("page_size", String(params.pageSize));
+    return fetchJson<AlgorithmSearchResult>(`/algorithms?${query.toString()}`);
   },
   algorithm: (slug: string) => fetchJson<AlgorithmDetail>(`/algorithms/${slug}`),
   execute: (code: string, stdin = "") =>

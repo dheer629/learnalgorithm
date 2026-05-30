@@ -22,13 +22,17 @@ async def sync_repository(session: AsyncSession, repo_dir: Path) -> dict:
     repo_path = _ensure_repo(repo_dir)
     count = 0
     skipped = 0
+    processed = 0
+    failures: list[dict[str, str]] = []
     for file_path in repo_path.rglob("*.py"):
         if _skip(file_path, repo_path):
             continue
         relative = file_path.relative_to(repo_path)
+        processed += 1
         try:
             parsed = parse_python_file(file_path)
-        except SyntaxError:
+        except Exception as exc:
+            failures.append({"path": str(relative), "error": type(exc).__name__, "message": str(exc)[:300]})
             skipped += 1
             continue
         category_name = relative.parts[0].replace("_", " ").title()
@@ -44,9 +48,10 @@ async def sync_repository(session: AsyncSession, repo_dir: Path) -> dict:
         algorithm.description = parsed.description or "No description is available yet."
         algorithm.source_code = parsed.source_code
         algorithm.functions = parsed.functions
+        algorithm.imports = parsed.imports
         algorithm.doctests = parsed.doctests
         algorithm.complexity = parsed.complexity
-        algorithm.tags = [category_slug, *relative.parts[:-1]]
+        algorithm.tags = _tags(category_slug, relative, parsed.functions, parsed.imports)
         algorithm.difficulty = _difficulty(parsed.source_code, parsed.functions)
         session.add(algorithm)
         count += 1
@@ -59,7 +64,13 @@ async def sync_repository(session: AsyncSession, repo_dir: Path) -> dict:
         )
     )
     await session.commit()
-    return {"synced": count, "skipped": skipped, "repo": str(repo_path)}
+    return {
+        "synced": count,
+        "skipped": skipped,
+        "files_processed": processed,
+        "failures": failures,
+        "repo": str(repo_path),
+    }
 
 
 def _ensure_repo(repo_dir: Path) -> Path:
@@ -98,3 +109,10 @@ def _difficulty(source: str, functions: list[dict]) -> str:
     if lines > 220 or len(functions) > 6:
         return "advanced"
     return "intermediate"
+
+
+def _tags(category_slug: str, relative: Path, functions: list[dict], imports: list[str]) -> list[str]:
+    tags = {category_slug, *(part.replace("_", "-").lower() for part in relative.parts[:-1])}
+    tags.update(function["name"].replace("_", "-").lower() for function in functions[:4] if function.get("name"))
+    tags.update(import_name.lower() for import_name in imports[:6])
+    return sorted(tags)

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - backend-configmap.yaml
+  - postgres.yaml
+  - redis.yaml
+  - backend-deployment.yaml
+  - backend-service.yaml
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+
+images:
+  - name: learnalgorithm-backend
+    newName: learnalgorithm-backend
+    newTag: local
+  - name: learnalgorithm-frontend
+    newName: learnalgorithm-frontend
+    newTag: local

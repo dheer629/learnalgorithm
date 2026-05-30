@@ -30,6 +30,7 @@ class Algorithm(Base):
     description: Mapped[str | None] = mapped_column(Text)
     source_code: Mapped[str] = mapped_column(Text)
     functions: Mapped[list[dict]] = mapped_column(JSONB, default=list)
+    imports: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
     doctests: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     complexity: Mapped[dict] = mapped_column(JSONB, default=dict)
     tags: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
@@ -41,3 +42,6 @@ class Algorithm(Base):
 
 
 Index("ix_algorithms_search_vector", Algorithm.search_vector, postgresql_using="gin")
+Index("ix_algorithms_category_id", Algorithm.category_id)
+Index("ix_algorithms_difficulty", Algorithm.difficulty)
+Index("ix_algorithms_tags", Algorithm.tags, postgresql_using="gin")

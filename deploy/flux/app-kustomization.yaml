@@ -1,0 +1,15 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: learnalgorithm-app
+  namespace: flux-system
+spec:
+  interval: 5m
+  prune: true
+  wait: true
+  timeout: 5m
+  sourceRef:
+    kind: GitRepository
+    name: learnalgorithm-repo
+  path: ./deploy/k8s
+  targetNamespace: learnalgorithm

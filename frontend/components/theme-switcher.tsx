@@ -21,17 +21,10 @@ export function ThemeSwitcher() {
   const { theme, setTheme } = usePreferences();
 
   useEffect(() => {
-    const savedTheme = window.localStorage.getItem("algolearn-theme");
-    if (savedTheme && savedTheme !== theme) {
-      setTheme(savedTheme);
-      document.documentElement.dataset.theme = savedTheme;
-      return;
-    }
     document.documentElement.dataset.theme = theme;
-  }, [setTheme, theme]);
+  }, [theme]);
 
   function changeTheme(nextTheme: string) {
-    window.localStorage.setItem("algolearn-theme", nextTheme);
     setTheme(nextTheme);
   }
 

@@ -1,6 +1,9 @@
 .env
 .env.local
 .env.*.local
+*.secret.yaml
+kubeconfig
+.kube/
 
 node_modules/
 .next/
@@ -15,6 +18,10 @@ __pycache__/
 .pytest_tmp/
 .ruff_cache/
 .qodo/
+.runtime/
+*.pid
+*.log
+tools/FLUXONM/local-sensitive/
 
 .DS_Store
 Thumbs.db

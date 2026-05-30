@@ -25,6 +25,20 @@ class AlgorithmListOut(BaseModel):
     difficulty: str
 
 
+class SearchMetaOut(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    offset: int
+    limit: int
+    sort: str
+
+
+class AlgorithmSearchOut(BaseModel):
+    items: list[AlgorithmListOut]
+    meta: SearchMetaOut
+
+
 class AlgorithmExampleOut(BaseModel):
     title: str
     command: str
@@ -47,6 +61,7 @@ class AlgorithmDetailOut(AlgorithmListOut):
     source_url: str
     source_code: str
     functions: list[dict]
+    imports: list[str] = Field(default_factory=list)
     doctests: list[str]
     examples: list[AlgorithmExampleOut] = Field(default_factory=list)
     complexity: dict
@@ -110,3 +125,23 @@ class VisualizeResponse(BaseModel):
     output: str = ""
     steps: list[TraceStepOut] = Field(default_factory=list)
     logs: list[str] = Field(default_factory=list)
+
+
+class HealthOut(BaseModel):
+    status: str
+
+
+class ReadyCheckOut(BaseModel):
+    status: str
+    checks: dict[str, str]
+
+
+class SyncStatusOut(BaseModel):
+    status: str = "idle"
+    last_started_at: str | None = None
+    last_finished_at: str | None = None
+    files_processed: int = 0
+    algorithms_updated: int = 0
+    skipped: int = 0
+    failures: list[dict[str, Any]] = Field(default_factory=list)
+    message: str | None = None

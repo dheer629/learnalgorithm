@@ -10,6 +10,7 @@ const config: Config = {
         foreground: "hsl(var(--foreground))",
         muted: "hsl(var(--muted))",
         border: "hsl(var(--border))",
+        panel: "hsl(var(--panel))",
         primary: "hsl(var(--primary))",
         accent: "hsl(var(--accent))"
       }
@@ -19,4 +20,3 @@ const config: Config = {
 };
 
 export default config;
-

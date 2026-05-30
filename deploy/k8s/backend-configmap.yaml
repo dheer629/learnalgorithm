@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: learnalgorithm-backend-config
+  namespace: learnalgorithm
+data:
+  APP_NAME: "Algorithm Learn API"
+  ENVIRONMENT: "local"
+  FRONTEND_ORIGIN: "http://localhost:3000"
+  CORS_ORIGINS: "http://localhost:3000"
+  PISTON_URL: "https://emkc.org/api/v2/piston/execute"
+  EXECUTION_TIMEOUT_SECONDS: "5"
+  EXECUTION_OUTPUT_LIMIT_BYTES: "200000"
+  VISUALIZATION_RESPONSE_LIMIT_BYTES: "500000"

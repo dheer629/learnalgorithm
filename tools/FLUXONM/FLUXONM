@@ -1,0 +1,5860 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Dheer_K8s_Command_Center.sh
+# ==============================================================================
+# Ultra Pro Max Kubernetes / vCluster / Flux Command Center
+#
+# Inspired by K9s / Bloomberg terminal style dashboards:
+#   - Boxed panels
+#   - Hotkeys
+#   - Command palette
+#   - Supervision mode by default
+#   - Management mode gated
+#   - Context/server/namespace lock
+#   - Full searchable logs; no --tail truncation in log viewer
+#   - Timestamped output capture
+#   - Audit trail
+#
+# Supported:
+#   - Ubuntu / WSL / RHEL-like Linux
+#   - vCluster in Docker
+#   - Any Kubernetes cluster reachable through kubeconfig
+#   - Flux v2.x, default pinned CLI v2.4.0 for Kubernetes v1.30.x compatibility
+#
+# ==============================================================================
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="6.7.0-vcluster-persistence-restore"
+
+STATE_DIR="${STATE_DIR:-$HOME/.Dheer_K8s_Command_Center}"
+LOG_DIR="$STATE_DIR/logs"
+OUT_ROOT="$STATE_DIR/output"
+DIAG_DIR="$STATE_DIR/diagnostics"
+PREF_FILE="$STATE_DIR/preferences.env"
+AUDIT_FILE="$STATE_DIR/audit.log"
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+OUTDIR="$OUT_ROOT/$RUN_ID"
+LOG_FILE="$LOG_DIR/command-center-$RUN_ID.log"
+
+HISTORY_DIR="$STATE_DIR/history"
+MASTER_LOG="$HISTORY_DIR/FLUXONM_master_history.log"
+COMMAND_INDEX="$HISTORY_DIR/command-index.tsv"
+LATEST_DIR_LINK="$STATE_DIR/latest-output"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$OUTDIR" "$DIAG_DIR" "$HISTORY_DIR"
+ln -sfn "$OUTDIR" "$LATEST_DIR_LINK" 2>/dev/null || true
+touch "$MASTER_LOG" "$COMMAND_INDEX" 2>/dev/null || true
+
+PF_DIR="$STATE_DIR/port-forward"
+PF_STATE_FILE="$PF_DIR/podinfo-demo.state"
+
+VCLUSTER_STATE_DIR="${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+VCLUSTER_CONTAINER_PREFIX="${VCLUSTER_CONTAINER_PREFIX:-vcluster.cp}"
+VCLUSTER_RESTORE_LOG="$LOG_DIR/vcluster-restore-$RUN_ID.log"
+
+mkdir -p "$PF_DIR" 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# Defaults
+# ------------------------------------------------------------------------------
+
+MODE="${MODE:-SUPERVISION}"                         # SUPERVISION | MANAGEMENT
+KUBECONFIG_PATH="${KUBECONFIG_PATH:-${KUBECONFIG:-$HOME/.kube/dev.kubeconfig}}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-}"
+LOCKED_CONTEXT="${LOCKED_CONTEXT:-}"
+LOCKED_CLUSTER_SERVER="${LOCKED_CLUSTER_SERVER:-}"
+LOCKED_NAMESPACE="${LOCKED_NAMESPACE:-default}"
+ACTIVE_NAMESPACE="${ACTIVE_NAMESPACE:-$LOCKED_NAMESPACE}"
+
+VCLUSTER_NAME="${VCLUSTER_NAME:-dev}"
+VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-docker}"
+VCLUSTER_DISTRO="${VCLUSTER_DISTRO:-k8s}"
+VCLUSTER_K8S_VERSION="${VCLUSTER_K8S_VERSION:-1.30.4}"
+VCLUSTER_KUBECONFIG="${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME}.kubeconfig}"
+
+FLUX_NAMESPACE="${FLUX_NAMESPACE:-flux-system}"
+FLUX_CLI_VERSION="${FLUX_CLI_VERSION:-v2.4.0}"
+
+GIT_PROVIDER="${GIT_PROVIDER:-generic}"             # github | generic
+GITHUB_OWNER="${GITHUB_OWNER:-}"
+GITHUB_REPO="${GITHUB_REPO:-}"
+GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+GITHUB_PATH="${GITHUB_PATH:-clusters/dev}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+REPO_URL="${REPO_URL:-}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+REPO_PATH="${REPO_PATH:-clusters/dev}"
+REPO_NAME="${REPO_NAME:-dheer-gitops-repo}"
+KUSTOMIZATION_NAME="${KUSTOMIZATION_NAME:-dheer-gitops}"
+
+SYNC_INTERVAL="${SYNC_INTERVAL:-1m}"
+RETRY_INTERVAL="${RETRY_INTERVAL:-30s}"
+TIMEOUT="${TIMEOUT:-5m}"
+
+ASSUME_YES=0
+VERBOSE=0
+NO_COLOR="${NO_COLOR:-0}"
+JSON_OUT=0
+
+# ------------------------------------------------------------------------------
+# Colors
+# ------------------------------------------------------------------------------
+
+if [[ "$NO_COLOR" == "1" || ! -t 1 ]]; then
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_MAGENTA=""; C_GREY=""; C_BLUE=""; C_WHITE=""
+else
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+  C_MAGENTA=$'\033[35m'
+  C_GREY=$'\033[90m'
+  C_BLUE=$'\033[34m'
+  C_WHITE=$'\033[97m'
+fi
+
+# ------------------------------------------------------------------------------
+# Logging / Audit
+# ------------------------------------------------------------------------------
+
+strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+
+log_file() {
+  printf '%s %s\n' "$(date '+%F %T')" "$(strip_ansi <<<"$*")" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+audit() {
+  local action="${1:-unknown}"
+  shift || true
+  printf '%s|user=%s|mode=%s|context=%s|namespace=%s|action=%s|%s\n' \
+    "$(date -Is)" "${USER:-unknown}" "$MODE" "${KUBE_CONTEXT:-unset}" "${ACTIVE_NAMESPACE:-unset}" "$action" "$*" >> "$AUDIT_FILE" 2>/dev/null || true
+}
+
+info()  { log_file "INFO  $*"; [[ "$JSON_OUT" == "1" ]] || printf '%b\n' "${C_CYAN}ℹ${C_RESET}  $*"; }
+ok()    { log_file "OK    $*"; [[ "$JSON_OUT" == "1" ]] || printf '%b\n' "${C_GREEN}✔${C_RESET}  ${C_BOLD}$*${C_RESET}"; }
+warn()  { log_file "WARN  $*"; [[ "$JSON_OUT" == "1" ]] || printf '%b\n' "${C_YELLOW}⚠${C_RESET}  $*" >&2; }
+err()   { log_file "ERROR $*"; [[ "$JSON_OUT" == "1" ]] || printf '%b\n' "${C_RED}✘${C_RESET}  ${C_BOLD}$*${C_RESET}" >&2; }
+debug() { [[ "$VERBOSE" == "1" ]] || return 0; log_file "DEBUG $*"; printf '%b\n' "${C_GREY}… $*${C_RESET}"; }
+step()  { log_file "STEP  $*"; [[ "$JSON_OUT" == "1" ]] || printf '\n%b\n' "${C_MAGENTA}${C_BOLD}▶ $*${C_RESET}"; }
+die()   { err "$1"; exit "${2:-1}"; }
+
+on_error() {
+  local rc=$?
+  local line="${1:-unknown}"
+  err "Failed at line $line with exit code $rc"
+  warn "Log: $LOG_FILE"
+  warn "Output directory: $OUTDIR"
+  exit "$rc"
+}
+trap 'on_error $LINENO' ERR
+
+# ------------------------------------------------------------------------------
+# Terminal UI primitives
+# ------------------------------------------------------------------------------
+
+term_width() {
+  local w
+  w="$(tput cols 2>/dev/null || echo 120)"
+  (( w < 96 )) && w=96
+  (( w > 160 )) && w=160
+  echo "$w"
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+  local out=""
+  local i
+  for ((i=0; i<count; i++)); do out="${out}${char}"; done
+  printf '%s' "$out"
+}
+
+clear_screen() {
+  [[ -t 1 ]] && command -v clear >/dev/null 2>&1 && clear || true
+}
+
+box_line() {
+  local text="${1:-}"
+  local width="${2:-$(term_width)}"
+  local inner=$((width-4))
+  printf '%b║%b %-*.*s %b║%b\n' "$C_CYAN" "$C_RESET" "$inner" "$inner" "$text" "$C_CYAN" "$C_RESET"
+}
+
+box_top() {
+  local width="${1:-$(term_width)}"
+  printf '%b╔%s╗%b\n' "$C_CYAN" "$(repeat_char "═" $((width-2)))" "$C_RESET"
+}
+
+box_mid() {
+  local width="${1:-$(term_width)}"
+  printf '%b╠%s╣%b\n' "$C_CYAN" "$(repeat_char "═" $((width-2)))" "$C_RESET"
+}
+
+box_bottom() {
+  local width="${1:-$(term_width)}"
+  printf '%b╚%s╝%b\n' "$C_CYAN" "$(repeat_char "═" $((width-2)))" "$C_RESET"
+}
+
+mini_bar() {
+  local width
+  width="$(term_width)"
+  printf '%b%s%b\n' "$C_GREY" "$(repeat_char "─" "$width")" "$C_RESET"
+}
+
+mode_badge_text() {
+  if [[ "$MODE" == "MANAGEMENT" ]]; then
+    echo "MANAGEMENT"
+  else
+    echo "SUPERVISION"
+  fi
+}
+
+mode_badge_color() {
+  if [[ "$MODE" == "MANAGEMENT" ]]; then
+    printf '%bMANAGEMENT%b' "$C_RED$C_BOLD" "$C_RESET"
+  else
+    printf '%bSUPERVISION%b' "$C_GREEN$C_BOLD" "$C_RESET"
+  fi
+}
+
+banner() {
+  [[ "$JSON_OUT" == "1" ]] && return 0
+  local w
+  w="$(term_width)"
+  box_top "$w"
+  box_line "" "$w"
+  box_line "   FLUXONM Command Center" "$w"
+  box_line "   Kubernetes · vCluster · Flux · Lifecycle · Observability" "$w"
+  box_line "   Production Control Plane · Supervision First · Management Gated" "$w"
+  box_line "" "$w"
+  box_bottom "$w"
+  printf '%bversion %s · host %s · run %s%b\n' "$C_GREY" "$SCRIPT_VERSION" "$(hostname 2>/dev/null || echo n/a)" "$RUN_ID" "$C_RESET"
+}
+
+status_header() {
+  load_prefs >/dev/null 2>&1 || true
+  local mode_text
+  mode_text="$(mode_badge_text)"
+  local ctx="${KUBE_CONTEXT:-$(current_context 2>/dev/null || echo unset)}"
+  local w
+  w="$(term_width)"
+
+  box_top "$w"
+  box_line " MODE ${mode_text}  │ CONTEXT ${ctx}  │ NAMESPACE ${LOCKED_NAMESPACE}  │ FLUX ${FLUX_NAMESPACE}" "$w"
+  box_line " KUBECONFIG ${KUBECONFIG_PATH}" "$w"
+  box_line " OUTPUT ${OUTDIR}" "$w"
+  box_bottom "$w"
+}
+
+
+header() {
+  clear_screen
+  banner
+  status_header
+}
+
+hotkey_bar_supervision() {
+  printf '%b%s%b\n' "$C_YELLOW" "[h]Health [s]Status [A]AppRun [F]Forward [O]History [Q]QuickFilter [v]vCluster [f]Flux [x]Diag [c]Ctx/NS [/]Palette [m]Mgmt [q]Quit" "$C_RESET"
+}
+
+hotkey_bar_management() {
+  printf '%b%s%b\n' "$C_RED" "[v]vCluster [f]Flux [o]GitOps [r]Restart [z]Scale [p]PodDelete [P]ForcePod [c]Ctx/NS [l]Lock [e]Prefs [s]Supervision [q]Quit" "$C_RESET"
+}
+
+pause_return() {
+  echo
+  read -r -p "Press Enter to continue..." _ || true
+}
+
+section() {
+  echo
+  printf '%b┌─ %s %b\n' "$C_CYAN$C_BOLD" "$1" "$C_RESET"
+}
+
+viewer() {
+  local file="$1"
+  [[ -s "$file" ]] || { warn "File empty or missing: $file"; return 0; }
+  if command -v less >/dev/null 2>&1 && [[ -t 1 ]]; then
+    LESS='-R -S -i -M --use-color' less "$file"
+  else
+    cat "$file"
+  fi
+}
+
+usage() {
+  cat <<USAGE
+${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+USAGE:
+  ${SCRIPT_NAME} [global-options] <command>
+
+GLOBAL OPTIONS:
+  --mode supervision       Read-only mode
+  --mode management        Mutating operations mode
+  -y, --yes                Assume yes for allowed management operations
+  -v, --verbose            Verbose
+      --json               JSON output where supported
+      --no-color           Disable color
+  -h, --help               Help
+
+MAIN:
+  start                    Production startup wizard: mode -> context -> namespace -> dashboard
+  dashboard                Interactive dashboard using saved lock
+  setup                    Install kubectl, helm, vcluster, flux
+  detect                   Detect reachable kube context
+  context-select           Choose kubeconfig/context interactively
+  namespace-select         Choose namespace interactively and lock it
+  lock-init                Initialize execution lock
+  lock-show                Show lock
+  target-select            Choose context and namespace interactively
+  self-test                Static and runtime sanity validation
+  install-shortcut         Install /usr/local/bin/FLUXONM shortcut
+  doctor                   Readiness check
+  status                   Platform status
+  diagnostics              Full diagnostics bundle
+  audit                    Show audit log
+  output-history           Show persistent command output history
+  output-open              Open previous captured output
+  output-master            Open cumulative master log
+  output-latest            List latest output directory
+  output-runs              List previous run directories
+  output-bundle            Bundle current run output
+  output-bundle-all        Bundle all history/output/logs
+
+KUBERNETES SUPERVISION:
+  k8s-status               Namespace resources
+  k8s-events               Namespace events
+  k8s-pods                 Pods
+  k8s-logs                 Full searchable logs, no tail trimming
+  k8s-describe             Describe selected resource
+  k8s-yaml                 Export namespace YAML
+  k8s-top                  Top nodes/pods if metrics-server exists
+
+KUBERNETES MANAGEMENT:
+  k8s-rollout-restart      Restart workload
+  k8s-scale                Scale workload
+  pod-delete               Delete pod
+  pod-force-delete         Force delete pod
+
+VCLUSTER:
+  vcluster-status
+  vcluster-persistence-status
+  vcluster-persistence-setup
+  vcluster-restore
+  vcluster-restore-install-shortcut
+  vcluster-backup-state
+  vcluster-safety-rules
+  vcluster-create
+  vcluster-delete
+  vcluster-pause
+  vcluster-resume
+
+GITOPS:
+  public-repo-deploy
+  public-repo-status
+  gitops-config
+  gitops-status
+  gitops-validate
+  gitops-print-command
+  gitops-provider-select
+  gitops-deploy
+
+FLUX:
+  flux-install
+  flux-status
+  flux-health
+  flux-logs                Full searchable controller logs
+  flux-trace
+  flux-bootstrap-github
+  flux-sync-generic
+  flux-repair-gotk-path    Regenerate missing gotk files under GitOps path
+  flux-repair-https        Repair failed SSH bootstrap to HTTPS token auth
+  flux-reconcile
+  flux-suspend
+  flux-resume
+  flux-delete-sync
+
+PREFERENCES:
+  prefs
+  set KEY VALUE
+  edit-prefs
+
+FIRST-TIME:
+  ${SCRIPT_NAME} setup
+  ${SCRIPT_NAME} start
+
+PRODUCTION SAFE FLOW:
+  ${SCRIPT_NAME} start
+  # Startup wizard asks:
+  #   1. Execution mode: SUPERVISION or MANAGEMENT
+  #   2. Kubeconfig/context
+  #   3. Namespace lock
+  #   4. Opens the matching dashboard
+USAGE
+}
+
+# ------------------------------------------------------------------------------
+# Preferences
+# ------------------------------------------------------------------------------
+
+load_prefs() {
+  local cli_mode="${MODE:-SUPERVISION}"
+  [[ -r "$PREF_FILE" ]] && . "$PREF_FILE"
+
+  MODE="$cli_mode"
+  KUBECONFIG_PATH="${KUBECONFIG_PATH:-${KUBECONFIG:-$HOME/.kube/dev.kubeconfig}}"
+  KUBE_CONTEXT="${KUBE_CONTEXT:-}"
+  LOCKED_CONTEXT="${LOCKED_CONTEXT:-$KUBE_CONTEXT}"
+  LOCKED_CLUSTER_SERVER="${LOCKED_CLUSTER_SERVER:-}"
+  LOCKED_NAMESPACE="${LOCKED_NAMESPACE:-default}"
+  ACTIVE_NAMESPACE="${ACTIVE_NAMESPACE:-$LOCKED_NAMESPACE}"
+
+  VCLUSTER_NAME="${VCLUSTER_NAME:-dev}"
+  VCLUSTER_DRIVER="${VCLUSTER_DRIVER:-docker}"
+  VCLUSTER_DISTRO="${VCLUSTER_DISTRO:-k8s}"
+  VCLUSTER_K8S_VERSION="${VCLUSTER_K8S_VERSION:-1.30.4}"
+  VCLUSTER_KUBECONFIG="${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME}.kubeconfig}"
+
+  FLUX_NAMESPACE="${FLUX_NAMESPACE:-flux-system}"
+  FLUX_CLI_VERSION="${FLUX_CLI_VERSION:-v2.4.0}"
+
+  GIT_PROVIDER="${GIT_PROVIDER:-generic}"
+  # Universal GitOps provider model
+  GIT_HOSTNAME="${GIT_HOSTNAME:-}"
+  GIT_OWNER="${GIT_OWNER:-${GITHUB_OWNER:-}}"
+  GIT_REPOSITORY="${GIT_REPOSITORY:-${GITHUB_REPO:-}}"
+  GIT_BRANCH="${GIT_BRANCH:-${GITHUB_BRANCH:-main}}"
+  GIT_PATH="${GIT_PATH:-${GITHUB_PATH:-clusters/dev}}"
+  GIT_USERNAME="${GIT_USERNAME:-git}"
+  GIT_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+  GIT_URL="${GIT_URL:-${REPO_URL:-}}"
+  GIT_AUTH_MODE="${GIT_AUTH_MODE:-token}"      # token | ssh | basic | bearer | none
+  GIT_PRIVATE_KEY_FILE="${GIT_PRIVATE_KEY_FILE:-}"
+  GIT_PASSWORD="${GIT_PASSWORD:-}"
+  GIT_PERSONAL="${GIT_PERSONAL:-false}"
+  GIT_PRIVATE="${GIT_PRIVATE:-true}"
+  GIT_WITH_BEARER_TOKEN="${GIT_WITH_BEARER_TOKEN:-false}"
+  GIT_EXTRA_FLAGS="${GIT_EXTRA_FLAGS:-}"
+  # Public repo deployment source-of-truth automation
+  PUBLIC_APP_NAME="${PUBLIC_APP_NAME:-public-demo}"
+  PUBLIC_APP_NAMESPACE="${PUBLIC_APP_NAMESPACE:-public-demo}"
+  PUBLIC_APP_REPO_URL="${PUBLIC_APP_REPO_URL:-}"
+  PUBLIC_APP_REPO_BRANCH="${PUBLIC_APP_REPO_BRANCH:-main}"
+  PUBLIC_APP_REPO_PATH="${PUBLIC_APP_REPO_PATH:-./}"
+  PUBLIC_APP_INTERVAL="${PUBLIC_APP_INTERVAL:-1m}"
+  PUBLIC_APP_TIMEOUT="${PUBLIC_APP_TIMEOUT:-5m}"
+  GITOPS_COMMIT_REPO_URL="${GITOPS_COMMIT_REPO_URL:-}"
+  GITOPS_COMMIT_BRANCH="${GITOPS_COMMIT_BRANCH:-${GIT_BRANCH:-main}}"
+  GITOPS_COMMIT_PATH="${GITOPS_COMMIT_PATH:-${GIT_PATH:-clusters/dev}}"
+  GIT_COMMIT_USER_NAME="${GIT_COMMIT_USER_NAME:-FLUXONM Bot}"
+  GIT_COMMIT_USER_EMAIL="${GIT_COMMIT_USER_EMAIL:-fluxonm@example.local}"
+
+
+  GITHUB_OWNER="${GITHUB_OWNER:-}"
+  GITHUB_REPO="${GITHUB_REPO:-}"
+  GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+  GITHUB_PATH="${GITHUB_PATH:-clusters/dev}"
+  GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+  REPO_URL="${REPO_URL:-}"
+  REPO_BRANCH="${REPO_BRANCH:-main}"
+  REPO_PATH="${REPO_PATH:-clusters/dev}"
+  REPO_NAME="${REPO_NAME:-dheer-gitops-repo}"
+  KUSTOMIZATION_NAME="${KUSTOMIZATION_NAME:-dheer-gitops}"
+
+  SYNC_INTERVAL="${SYNC_INTERVAL:-1m}"
+  RETRY_INTERVAL="${RETRY_INTERVAL:-30s}"
+  TIMEOUT="${TIMEOUT:-5m}"
+}
+
+save_prefs() {
+  mkdir -p "$STATE_DIR"
+  cat > "$PREF_FILE" <<PREF
+# Dheer K8s Command Center preferences
+# Generated: $(date '+%F %T')
+
+KUBECONFIG_PATH="${KUBECONFIG_PATH}"
+KUBE_CONTEXT="${KUBE_CONTEXT}"
+LOCKED_CONTEXT="${LOCKED_CONTEXT}"
+LOCKED_CLUSTER_SERVER="${LOCKED_CLUSTER_SERVER}"
+LOCKED_NAMESPACE="${LOCKED_NAMESPACE}"
+ACTIVE_NAMESPACE="${ACTIVE_NAMESPACE}"
+
+VCLUSTER_NAME="${VCLUSTER_NAME}"
+VCLUSTER_DRIVER="${VCLUSTER_DRIVER}"
+VCLUSTER_DISTRO="${VCLUSTER_DISTRO}"
+VCLUSTER_K8S_VERSION="${VCLUSTER_K8S_VERSION}"
+VCLUSTER_KUBECONFIG="${VCLUSTER_KUBECONFIG}"
+
+FLUX_NAMESPACE="${FLUX_NAMESPACE}"
+FLUX_CLI_VERSION="${FLUX_CLI_VERSION}"
+
+GIT_PROVIDER="${GIT_PROVIDER}"
+GIT_HOSTNAME="${GIT_HOSTNAME}"
+GIT_OWNER="${GIT_OWNER}"
+GIT_REPOSITORY="${GIT_REPOSITORY}"
+GIT_BRANCH="${GIT_BRANCH}"
+GIT_PATH="${GIT_PATH}"
+GIT_USERNAME="${GIT_USERNAME}"
+GIT_TOKEN="${GIT_TOKEN}"
+GIT_URL="${GIT_URL}"
+GIT_AUTH_MODE="${GIT_AUTH_MODE}"
+GIT_PRIVATE_KEY_FILE="${GIT_PRIVATE_KEY_FILE}"
+GIT_PASSWORD="${GIT_PASSWORD}"
+GIT_PERSONAL="${GIT_PERSONAL}"
+GIT_PRIVATE="${GIT_PRIVATE}"
+GIT_WITH_BEARER_TOKEN="${GIT_WITH_BEARER_TOKEN}"
+GIT_EXTRA_FLAGS="${GIT_EXTRA_FLAGS}"
+PUBLIC_APP_NAME="${PUBLIC_APP_NAME}"
+PUBLIC_APP_NAMESPACE="${PUBLIC_APP_NAMESPACE}"
+PUBLIC_APP_REPO_URL="${PUBLIC_APP_REPO_URL}"
+PUBLIC_APP_REPO_BRANCH="${PUBLIC_APP_REPO_BRANCH}"
+PUBLIC_APP_REPO_PATH="${PUBLIC_APP_REPO_PATH}"
+PUBLIC_APP_INTERVAL="${PUBLIC_APP_INTERVAL}"
+PUBLIC_APP_TIMEOUT="${PUBLIC_APP_TIMEOUT}"
+GITOPS_COMMIT_REPO_URL="${GITOPS_COMMIT_REPO_URL}"
+GITOPS_COMMIT_BRANCH="${GITOPS_COMMIT_BRANCH}"
+GITOPS_COMMIT_PATH="${GITOPS_COMMIT_PATH}"
+GIT_COMMIT_USER_NAME="${GIT_COMMIT_USER_NAME}"
+GIT_COMMIT_USER_EMAIL="${GIT_COMMIT_USER_EMAIL}"
+
+
+GITHUB_OWNER="${GITHUB_OWNER}"
+GITHUB_REPO="${GITHUB_REPO}"
+GITHUB_BRANCH="${GITHUB_BRANCH}"
+GITHUB_PATH="${GITHUB_PATH}"
+GITHUB_TOKEN="${GITHUB_TOKEN}"
+
+REPO_URL="${REPO_URL}"
+REPO_BRANCH="${REPO_BRANCH}"
+REPO_PATH="${REPO_PATH}"
+REPO_NAME="${REPO_NAME}"
+KUSTOMIZATION_NAME="${KUSTOMIZATION_NAME}"
+
+SYNC_INTERVAL="${SYNC_INTERVAL}"
+RETRY_INTERVAL="${RETRY_INTERVAL}"
+TIMEOUT="${TIMEOUT}"
+PREF
+  chmod 600 "$PREF_FILE" 2>/dev/null || true
+  ok "Preferences saved: $PREF_FILE"
+}
+
+cmd_prefs() {
+  load_prefs
+  [[ -r "$PREF_FILE" ]] || { warn "No preferences found."; return 0; }
+  sed 's/GITHUB_TOKEN=.*/GITHUB_TOKEN="***masked***"/' "$PREF_FILE" | sed 's/^/  /'
+}
+
+cmd_set() {
+  require_management
+  local key="${1:-}"
+  local value="${2:-}"
+  [[ -n "$key" && -n "$value" ]] || die "Usage: $SCRIPT_NAME --mode management set KEY VALUE"
+
+  case "$key" in
+    kubeconfig) KUBECONFIG_PATH="$value" ;;
+    context) KUBE_CONTEXT="$value" ;;
+    namespace) ACTIVE_NAMESPACE="$value"; LOCKED_NAMESPACE="$value" ;;
+    flux_namespace) FLUX_NAMESPACE="$value" ;;
+    vcluster_name) VCLUSTER_NAME="$value"; VCLUSTER_KUBECONFIG="$HOME/.kube/${value}.kubeconfig" ;;
+    vcluster_version) VCLUSTER_K8S_VERSION="$value" ;;
+    vcluster_distro) VCLUSTER_DISTRO="$value" ;;
+    flux_cli_version) FLUX_CLI_VERSION="$value" ;;
+    repo_url) REPO_URL="$value" ;;
+    repo_branch) REPO_BRANCH="$value" ;;
+    repo_path) REPO_PATH="$value" ;;
+    repo_name) REPO_NAME="$value" ;;
+    kustomization_name) KUSTOMIZATION_NAME="$value" ;;
+    github_owner) GITHUB_OWNER="$value" ;;
+    github_repo) GITHUB_REPO="$value" ;;
+    github_branch) GITHUB_BRANCH="$value" ;;
+    github_path) GITHUB_PATH="$value" ;;
+    github_token) GITHUB_TOKEN="$value" ;;
+    *) die "Unsupported key: $key" ;;
+  esac
+
+  save_prefs
+  audit "set" "key=$key"
+}
+
+cmd_edit_prefs() {
+  require_management
+  [[ -r "$PREF_FILE" ]] || save_prefs
+  "${EDITOR:-vi}" "$PREF_FILE"
+  audit "edit-prefs"
+}
+
+
+# ------------------------------------------------------------------------------
+# Ultra Pro Max operation preflight compatibility helpers
+# ------------------------------------------------------------------------------
+
+operation_summary() {
+  local action="${1:-operation}"
+  load_prefs >/dev/null 2>&1 || true
+
+  echo
+  printf '%b┌─ Operation Summary %b\n' "$C_CYAN$C_BOLD" "$C_RESET"
+  printf '│ Action      : %s\n' "$action"
+  printf '│ Mode        : %s\n' "$MODE"
+  printf '│ Kubeconfig  : %s\n' "$KUBECONFIG_PATH"
+  printf '│ Context     : %s\n' "${KUBE_CONTEXT:-$(current_context 2>/dev/null || echo unset)}"
+  printf '│ Namespace   : %s\n' "$ACTIVE_NAMESPACE"
+  printf '│ Flux NS     : %s\n' "$FLUX_NAMESPACE"
+  printf '│ Output Dir  : %s\n' "$OUTDIR"
+  printf '└──────────────────────────────────────────────────────────────────────────────\n'
+}
+
+confirm_read_operation() {
+  local action="${1:-operation}"
+  operation_summary "$action"
+
+  # Dashboard read actions should not become annoying. Default is Yes.
+  [[ "${DHEER_SKIP_READ_CONFIRM:-0}" == "1" ]] && return 0
+
+  if [[ -t 0 ]]; then
+    read -r -p "Run this supervision operation? [Y/n]: " ans || true
+    ans="${ans:-Y}"
+    [[ "$ans" =~ ^[Yy]$ ]]
+  else
+    return 0
+  fi
+}
+
+resource_summary() {
+  local title="${1:-Resource Summary}"
+  echo
+  printf '%b┌─ %s %b\n' "$C_CYAN$C_BOLD" "$title" "$C_RESET"
+
+  if command -v kubectl >/dev/null 2>&1 && [[ -s "${KUBECONFIG_PATH:-}" ]]; then
+    kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk 'BEGIN{c=0}{c++}END{printf "│ Pods        : %s\n", c+0}' || true
+    kubectl_ctx get deploy -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk 'BEGIN{c=0}{c++}END{printf "│ Deployments : %s\n", c+0}' || true
+    kubectl_ctx get svc -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk 'BEGIN{c=0}{c++}END{printf "│ Services    : %s\n", c+0}' || true
+    kubectl_ctx get events -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk 'BEGIN{c=0}{c++}END{printf "│ Events      : %s\n", c+0}' || true
+  else
+    printf '│ Kubernetes target not available yet\n'
+  fi
+
+  printf '└──────────────────────────────────────────────────────────────────────────────\n'
+}
+
+show_command_preview() {
+  local title="$1"; shift
+  echo
+  printf '%b┌─ Command Preview: %s %b\n' "$C_YELLOW$C_BOLD" "$title" "$C_RESET"
+  printf '│ '
+  printf '%q ' "$@"
+  echo
+  printf '└──────────────────────────────────────────────────────────────────────────────\n'
+}
+
+quick_filter_items() {
+  local pattern="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [[ -z "$pattern" || "$item" == *"$pattern"* ]]; then
+      printf '%s\n' "$item"
+    fi
+  done
+}
+
+select_from_list() {
+  local prompt="$1"; shift
+  local original_items=("$@")
+  local filtered_items=("${original_items[@]}")
+  local filter=""
+  local choice item i
+
+  if [[ ${#original_items[@]} -eq 0 ]]; then
+    warn "No resources available for selection."
+    return 1
+  fi
+
+  while true; do
+    echo
+    printf '%b┌─ Selection: %s %b\n' "$C_CYAN$C_BOLD" "$prompt" "$C_RESET"
+    printf '│ Total: %s | Showing: %s | Filter: %s\n' "${#original_items[@]}" "${#filtered_items[@]}" "${filter:-<none>}"
+    printf '└──────────────────────────────────────────────────────────────────────────────\n'
+
+    if [[ ${#filtered_items[@]} -eq 0 ]]; then
+      warn "No matching resources for filter: $filter"
+    else
+      i=1
+      for item in "${filtered_items[@]}"; do
+        printf '  [%s] %s\n' "$i" "$item"
+        i=$((i+1))
+      done
+    fi
+
+    echo
+    echo "Quick actions: /text filter | * clear | q cancel"
+    read -r -p "$prompt: " choice || true
+
+    case "$choice" in
+      q|Q)
+        warn "Selection cancelled."
+        return 1
+        ;;
+      '*')
+        filter=""
+        filtered_items=("${original_items[@]}")
+        continue
+        ;;
+      /*)
+        filter="${choice#/}"
+        mapfile -t filtered_items < <(quick_filter_items "$filter" "${original_items[@]}")
+        continue
+        ;;
+      "")
+        warn "No selection entered."
+        continue
+        ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#filtered_items[@]} )); then
+          echo "${filtered_items[$((choice-1))]}"
+          return 0
+        fi
+        warn "Invalid selection: $choice"
+        ;;
+    esac
+  done
+}
+
+select_k8s_resource_name() {
+  local rtype="$1"
+  local title="${2:-Select resource}"
+  local items=()
+
+  mapfile -t items < <(kubectl_ctx get "$rtype" -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk '{print $1}' | sort)
+
+  if [[ ${#items[@]} -eq 0 ]]; then
+    warn "No resources found: type=$rtype namespace=$ACTIVE_NAMESPACE"
+    echo
+    echo "Available resource summary:"
+    kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide 2>/dev/null || true
+    return 1
+  fi
+
+  select_from_list "$title" "${items[@]}"
+}
+
+# ------------------------------------------------------------------------------
+# Context / Lock
+# ------------------------------------------------------------------------------
+
+export_kubeconfig() {
+  export KUBECONFIG="$KUBECONFIG_PATH"
+}
+
+kubectl_ctx() {
+  export_kubeconfig
+  if [[ -n "$KUBE_CONTEXT" ]]; then
+    kubectl --context "$KUBE_CONTEXT" "$@"
+  else
+    kubectl "$@"
+  fi
+}
+
+flux_ctx() {
+  export_kubeconfig
+  if [[ -n "$KUBE_CONTEXT" ]]; then
+    flux --context "$KUBE_CONTEXT" "$@"
+  else
+    flux "$@"
+  fi
+}
+
+current_context() {
+  export_kubeconfig
+  if [[ -n "$KUBE_CONTEXT" ]]; then
+    echo "$KUBE_CONTEXT"
+  else
+    kubectl config current-context 2>/dev/null || true
+  fi
+}
+
+current_cluster_name() {
+  local ctx="$1"
+  export_kubeconfig
+  kubectl config view -o jsonpath="{.contexts[?(@.name==\"${ctx}\")].context.cluster}" 2>/dev/null || true
+}
+
+current_cluster_server() {
+  local ctx="$1"
+  local cluster
+  cluster="$(current_cluster_name "$ctx")"
+  [[ -n "$cluster" ]] || return 0
+  kubectl config view -o jsonpath="{.clusters[?(@.name==\"${cluster}\")].cluster.server}" 2>/dev/null || true
+}
+
+validate_lock() {
+  load_prefs
+  export_kubeconfig
+
+  [[ -s "$KUBECONFIG_PATH" ]] || die "Kubeconfig not found: $KUBECONFIG_PATH"
+
+  local ctx server
+  ctx="$(current_context)"
+  [[ -n "$ctx" ]] || die "No active kube context"
+
+  server="$(current_cluster_server "$ctx")"
+  [[ -n "$server" ]] || die "Unable to resolve cluster server for context $ctx"
+
+  [[ -z "$LOCKED_CONTEXT" || "$ctx" == "$LOCKED_CONTEXT" ]] || die "Context lock mismatch: current=$ctx locked=$LOCKED_CONTEXT"
+  [[ -z "$LOCKED_CLUSTER_SERVER" || "$server" == "$LOCKED_CLUSTER_SERVER" ]] || die "Cluster server lock mismatch"
+  [[ "$ACTIVE_NAMESPACE" == "$LOCKED_NAMESPACE" ]] || die "Namespace lock mismatch: active=$ACTIVE_NAMESPACE locked=$LOCKED_NAMESPACE"
+}
+
+confirm_management() {
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  echo
+  warn "MANAGEMENT action requested"
+  info "Context   : ${LOCKED_CONTEXT}"
+  info "Namespace : ${LOCKED_NAMESPACE}"
+  read -r -p "Type MANAGEMENT to continue: " typed || true
+  [[ "$typed" == "MANAGEMENT" ]]
+}
+
+require_supervision() {
+  validate_lock
+  if declare -F confirm_read_operation >/dev/null 2>&1; then
+    confirm_read_operation "${FUNCNAME[1]:-supervision-operation}" || die "Operation cancelled"
+  fi
+}
+
+require_management() {
+  validate_lock
+  if declare -F operation_summary >/dev/null 2>&1; then
+    operation_summary "${FUNCNAME[1]:-management-operation}"
+  fi
+  [[ "$MODE" == "MANAGEMENT" ]] || die "Blocked. Use: $SCRIPT_NAME --mode management <command>"
+  confirm_management || die "Management confirmation failed"
+}
+
+cmd_lock_init() {
+  MODE="MANAGEMENT"
+  load_prefs
+  export_kubeconfig
+
+  [[ -s "$KUBECONFIG_PATH" ]] || die "Kubeconfig not found: $KUBECONFIG_PATH"
+
+  if [[ -z "$KUBE_CONTEXT" ]]; then
+    KUBE_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
+  fi
+  [[ -n "$KUBE_CONTEXT" ]] || die "Cannot resolve context"
+
+  LOCKED_CONTEXT="$KUBE_CONTEXT"
+  LOCKED_CLUSTER_SERVER="$(current_cluster_server "$KUBE_CONTEXT")"
+
+  read -r -p "Lock namespace [$ACTIVE_NAMESPACE]: " ns || true
+  ACTIVE_NAMESPACE="${ns:-$ACTIVE_NAMESPACE}"
+  LOCKED_NAMESPACE="$ACTIVE_NAMESPACE"
+
+  save_prefs
+  audit "lock-init" "context=$LOCKED_CONTEXT namespace=$LOCKED_NAMESPACE"
+  ok "Execution lock initialized"
+  cmd_lock_show
+}
+
+cmd_lock_show() {
+  load_prefs
+  echo "Kubeconfig     : $KUBECONFIG_PATH"
+  echo "Context        : $KUBE_CONTEXT"
+  echo "Cluster Server : $LOCKED_CLUSTER_SERVER"
+  echo "Namespace      : $LOCKED_NAMESPACE"
+  echo "Mode           : $MODE"
+}
+
+cmd_detect() {
+  header
+  step "Detect reachable Kubernetes contexts"
+
+  local files=()
+  [[ -n "${KUBECONFIG:-}" ]] && IFS=':' read -ra files <<< "$KUBECONFIG"
+  [[ -f "$HOME/.kube/config" ]] && files+=("$HOME/.kube/config")
+  while IFS= read -r f; do files+=("$f"); done < <(find "$HOME/.kube" -maxdepth 1 -type f -name "*.kubeconfig" 2>/dev/null || true)
+
+  local found=0
+  for file in "${files[@]}"; do
+    [[ -s "$file" ]] || continue
+    export KUBECONFIG="$file"
+    while IFS= read -r ctx; do
+      [[ -n "$ctx" ]] || continue
+      if kubectl --context "$ctx" get nodes >/dev/null 2>&1; then
+        echo "FOUND | kubeconfig=$file | context=$ctx | server=$(current_cluster_server "$ctx")"
+        KUBECONFIG_PATH="$file"
+        KUBE_CONTEXT="$ctx"
+        found=1
+      fi
+    done < <(kubectl config get-contexts -o name 2>/dev/null || true)
+  done
+
+  if [[ "$found" == "1" ]]; then
+    LOCKED_CONTEXT="$KUBE_CONTEXT"
+    LOCKED_CLUSTER_SERVER="$(current_cluster_server "$KUBE_CONTEXT")"
+    save_prefs
+    ok "Detected and saved reachable context: $KUBE_CONTEXT"
+  else
+    warn "No reachable context detected"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Captured execution / selection
+# ------------------------------------------------------------------------------
+
+run_capture() {
+  local label="$1"; shift
+  local safe_label out errf
+  safe_label="$(tr -cs 'A-Za-z0-9._-' '_' <<<"$label" | sed 's/_$//')"
+  out="$OUTDIR/${safe_label}.out"
+  errf="$OUTDIR/${safe_label}.err"
+
+  audit "run" "$label :: $*"
+
+  {
+    echo "### $label"
+    echo "### $(date -Is)"
+    echo "### command: $*"
+    echo
+    "$@"
+  } >"$out" 2>"$errf" || {
+    local rc=$?
+    cat "$out"
+    [[ -s "$errf" ]] && cat "$errf" >&2
+    warn "Command failed rc=$rc output=$out error=$errf"
+    return "$rc"
+  }
+
+  cat "$out"
+  [[ -s "$errf" ]] && cat "$errf" >&2 || true
+  info "Captured: $out"
+}
+
+select_from_list() {
+  local prompt="$1"; shift
+  local items=("$@")
+  local i=1
+  for item in "${items[@]}"; do
+    printf '  [%s] %s\n' "$i" "$item"
+    i=$((i+1))
+  done
+  read -r -p "$prompt: " choice || true
+  [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+  (( choice >= 1 && choice <= ${#items[@]} )) || return 1
+  echo "${items[$((choice-1))]}"
+}
+
+# ------------------------------------------------------------------------------
+# Install
+# ------------------------------------------------------------------------------
+
+install_base_tools() {
+  step "Install base tools"
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y
+    sudo apt-get install -y curl ca-certificates git jq tar gzip unzip less procps
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y curl ca-certificates git jq tar gzip unzip less procps-ng
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum install -y curl ca-certificates git jq tar gzip unzip less procps-ng
+  else
+    warn "Unknown package manager. Install curl git jq tar gzip unzip less manually."
+  fi
+}
+
+install_kubectl() {
+  if command -v kubectl >/dev/null 2>&1; then ok "kubectl present"; return 0; fi
+  step "Install kubectl"
+  local stable tmp
+  stable="$(curl -L -s https://dl.k8s.io/release/stable.txt)"
+  tmp="$(mktemp)"
+  curl -fL -o "$tmp" "https://dl.k8s.io/release/${stable}/bin/linux/amd64/kubectl"
+  chmod +x "$tmp"
+  sudo install -m 0755 "$tmp" /usr/local/bin/kubectl
+  rm -f "$tmp"
+}
+
+install_helm() {
+  if command -v helm >/dev/null 2>&1; then ok "helm present"; return 0; fi
+  step "Install helm"
+  curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+}
+
+install_vcluster() {
+  if command -v vcluster >/dev/null 2>&1; then ok "vcluster present: $(vcluster --version 2>/dev/null | head -1)"; return 0; fi
+  step "Install vcluster"
+  local ver="0.34.0" tmp
+  tmp="$(mktemp)"
+  curl -fL --retry 5 --retry-delay 5 --connect-timeout 20 --max-time 900 -o "$tmp" "https://github.com/loft-sh/vcluster/releases/download/v${ver}/vcluster-linux-amd64"
+  chmod +x "$tmp"
+  sudo install -m 0755 "$tmp" /usr/local/bin/vcluster
+  rm -f "$tmp"
+}
+
+install_flux() {
+  local wanted="${FLUX_CLI_VERSION#v}"
+  if command -v flux >/dev/null 2>&1; then
+    local current
+    current="$(flux --version 2>/dev/null | awk '{print $3}' || true)"
+    if [[ "$current" == "$wanted" || "$current" == "v$wanted" ]]; then
+      ok "flux present: $(flux --version)"
+      return 0
+    fi
+    warn "Flux CLI mismatch current=$(flux --version 2>/dev/null || true) wanted=v$wanted"
+  fi
+
+  step "Install Flux CLI v$wanted"
+  local tmp
+  tmp="$(mktemp -d)"
+  curl -fL --retry 5 --retry-delay 5 --connect-timeout 20 --max-time 300 -o "$tmp/flux.tar.gz" "https://github.com/fluxcd/flux2/releases/download/v${wanted}/flux_${wanted}_linux_amd64.tar.gz"
+  tar -xzf "$tmp/flux.tar.gz" -C "$tmp"
+  sudo install -m 0755 "$tmp/flux" /usr/local/bin/flux
+  rm -rf "$tmp"
+  ok "flux installed: $(flux --version)"
+}
+
+cmd_setup() {
+  header
+  install_base_tools
+  install_kubectl
+  install_helm
+  install_vcluster
+  install_flux
+  save_prefs
+  ok "Setup complete"
+}
+
+# ------------------------------------------------------------------------------
+# Doctor / status
+# ------------------------------------------------------------------------------
+
+cmd_doctor() {
+  header
+  require_supervision
+  step "Doctor"
+
+  local fail=0
+  for c in kubectl helm vcluster flux jq curl git; do
+    if command -v "$c" >/dev/null 2>&1; then ok "$c present"; else warn "$c missing"; fail=1; fi
+  done
+
+  kubectl_ctx get nodes -o wide || fail=1
+  kubectl_ctx get ns "$ACTIVE_NAMESPACE" || warn "Namespace $ACTIVE_NAMESPACE not present"
+  flux_ctx check --pre || true
+
+  (( fail == 0 )) || die "Doctor found issues"
+  ok "Doctor complete"
+}
+
+cmd_status() {
+  header
+  require_supervision
+  section "Kubernetes"
+  kubectl_ctx get nodes -o wide || true
+  section "Namespace: $ACTIVE_NAMESPACE"
+  kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide || true
+  section "vCluster"
+  vcluster list 2>/dev/null || true
+  section "Flux"
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide || true
+    flux_ctx get all -A || true
+  else
+    warn "Flux namespace not found: $FLUX_NAMESPACE"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# vCluster
+# ------------------------------------------------------------------------------
+
+cmd_vcluster_status() {
+  header
+  require_supervision
+  vcluster list || true
+  echo
+  docker ps -a --filter "name=vcluster" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+}
+
+cmd_vcluster_create() {
+  require_management
+  step "Create vCluster $VCLUSTER_NAME"
+  vcluster use driver "$VCLUSTER_DRIVER" || true
+  vcluster create "$VCLUSTER_NAME" --driver "$VCLUSTER_DRIVER" --set "controlPlane.distro.${VCLUSTER_DISTRO}.version=v${VCLUSTER_K8S_VERSION#v}"
+  vcluster connect "$VCLUSTER_NAME" --print > "$VCLUSTER_KUBECONFIG" 2>/dev/null || true
+  ok "vCluster created. Kubeconfig: $VCLUSTER_KUBECONFIG"
+}
+
+cmd_vcluster_delete() { require_management; vcluster delete "$VCLUSTER_NAME" || true; rm -f "$VCLUSTER_KUBECONFIG" 2>/dev/null || true; ok "vCluster deleted: $VCLUSTER_NAME"; }
+cmd_vcluster_pause() { require_management; vcluster pause "$VCLUSTER_NAME"; }
+cmd_vcluster_resume() { require_management; vcluster resume "$VCLUSTER_NAME"; }
+
+# ------------------------------------------------------------------------------
+# Kubernetes supervision
+# ------------------------------------------------------------------------------
+
+cmd_k8s_status() {
+  header
+  require_supervision
+  kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide || true
+  echo
+  kubectl_ctx get cm,secret,sa,role,rolebinding,pvc,ingress -n "$ACTIVE_NAMESPACE" -o wide || true
+}
+
+cmd_k8s_pods() {
+  require_supervision
+  kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" -o wide || true
+}
+
+cmd_k8s_events() {
+  require_supervision
+  kubectl_ctx get events -n "$ACTIVE_NAMESPACE" --sort-by=.lastTimestamp
+}
+
+cmd_k8s_top() {
+  require_supervision
+  kubectl_ctx top nodes || true
+  echo
+  kubectl_ctx top pods -n "$ACTIVE_NAMESPACE" || true
+}
+
+cmd_k8s_yaml() {
+  require_supervision
+  local out="$OUTDIR/namespace-${ACTIVE_NAMESPACE}.yaml"
+  kubectl_ctx get all,cm,secret,sa,role,rolebinding,pvc,ingress -n "$ACTIVE_NAMESPACE" -o yaml > "$out" 2>/dev/null || true
+  ok "YAML exported: $out"
+}
+
+cmd_k8s_logs() {
+  require_supervision
+  local pods=()
+  local pod file rc
+
+  while true; do
+    resource_summary "Namespace Resource Summary before Logs"
+    echo
+    echo "Pods in namespace: $ACTIVE_NAMESPACE"
+    kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" -o wide 2>/dev/null || true
+
+    mapfile -t pods < <(kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk '{print $1}' | sort)
+
+    if [[ ${#pods[@]} -eq 0 ]]; then
+      warn "No pods available in namespace: $ACTIVE_NAMESPACE"
+      echo
+      echo "Suggestions:"
+      echo "  - Press c in dashboard to choose another namespace"
+      echo "  - Run: $SCRIPT_NAME k8s-status"
+      return 0
+    fi
+
+    set +e
+    pod="$(select_from_list "Select pod for full searchable logs" "${pods[@]}")"
+    rc=$?
+    set -e
+
+    [[ $rc -eq 2 ]] && continue
+    [[ $rc -eq 0 ]] || { warn "Log selection cancelled."; return 0; }
+    break
+  done
+
+  file="$OUTDIR/logs-${ACTIVE_NAMESPACE}-${pod}.log"
+  show_command_preview "Full pod logs" kubectl logs -n "$ACTIVE_NAMESPACE" "$pod" --all-containers=true
+  info "Capturing FULL logs without trimming. Search inside less using /pattern"
+  kubectl_ctx logs -n "$ACTIVE_NAMESPACE" "$pod" --all-containers=true > "$file" 2>&1 || true
+  ok "Full logs captured: $file"
+  viewer "$file"
+}
+
+cmd_k8s_describe() {
+  require_supervision
+  local resource_types=("pod" "deploy" "sts" "ds" "svc" "cm" "secret" "pvc" "job" "cronjob" "ingress")
+  local rtype name rc
+
+  resource_summary "Namespace Resource Summary before Describe"
+  echo
+  kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide 2>/dev/null || true
+
+  set +e
+  rtype="$(select_from_list "Select resource type" "${resource_types[@]}")"
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { warn "Describe cancelled."; return 0; }
+
+  set +e
+  name="$(select_k8s_resource_name "$rtype" "Select $rtype to describe")"
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { warn "No $rtype selected."; return 0; }
+
+  show_command_preview "Describe resource" kubectl describe "$rtype" "$name" -n "$ACTIVE_NAMESPACE"
+  kubectl_ctx describe "$rtype" "$name" -n "$ACTIVE_NAMESPACE"
+}
+
+# ------------------------------------------------------------------------------
+# Kubernetes management
+# ------------------------------------------------------------------------------
+
+cmd_k8s_rollout_restart() {
+  require_management
+  read -r -p "Resource type [deploy]: " rtype; rtype="${rtype:-deploy}"
+  mapfile -t names < <(kubectl_ctx get "$rtype" -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk '{print $1}')
+  [[ ${#names[@]} -gt 0 ]] || die "No resources found"
+  local name
+  name="$(select_from_list "Select resource" "${names[@]}")" || die "Invalid selection"
+  kubectl_ctx rollout restart "$rtype/$name" -n "$ACTIVE_NAMESPACE"
+  audit "rollout-restart" "$rtype/$name"
+}
+
+cmd_k8s_scale() {
+  require_management
+  read -r -p "Resource type [deploy]: " rtype; rtype="${rtype:-deploy}"
+  mapfile -t names < <(kubectl_ctx get "$rtype" -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | awk '{print $1}')
+  [[ ${#names[@]} -gt 0 ]] || die "No resources found"
+  local name replicas
+  name="$(select_from_list "Select resource" "${names[@]}")" || die "Invalid selection"
+  read -r -p "Replicas: " replicas
+  [[ "$replicas" =~ ^[0-9]+$ ]] || die "Invalid replicas"
+  kubectl_ctx scale "$rtype/$name" -n "$ACTIVE_NAMESPACE" --replicas="$replicas"
+  audit "scale" "$rtype/$name replicas=$replicas"
+}
+
+cmd_pod_delete() {
+  require_management
+  local pod rc
+  resource_summary "Before Pod Delete"
+  kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" -o wide || true
+  set +e
+  pod="$(select_k8s_resource_name "pod" "Select pod to delete")"
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { warn "Pod delete cancelled."; return 0; }
+  show_command_preview "Delete pod" kubectl delete pod "$pod" -n "$ACTIVE_NAMESPACE"
+  kubectl_ctx delete pod "$pod" -n "$ACTIVE_NAMESPACE"
+  audit "pod-delete" "$pod"
+}
+
+cmd_pod_force_delete() {
+  require_management
+  local pod rc
+  resource_summary "Before FORCE Pod Delete"
+  kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" -o wide || true
+  set +e
+  pod="$(select_k8s_resource_name "pod" "Select pod to FORCE delete")"
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { warn "Force pod delete cancelled."; return 0; }
+  show_command_preview "Force delete pod" kubectl delete pod "$pod" -n "$ACTIVE_NAMESPACE" --force --grace-period=0
+  read -r -p "Type FORCE to delete $pod immediately: " typed
+  [[ "$typed" == "FORCE" ]] || die "Force delete aborted"
+  kubectl_ctx delete pod "$pod" -n "$ACTIVE_NAMESPACE" --force --grace-period=0
+  audit "pod-force-delete" "$pod"
+}
+
+# ------------------------------------------------------------------------------
+# Flux
+# ------------------------------------------------------------------------------
+
+flux_ns_exists() { kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; }
+flux_crds_exist() { kubectl_ctx get crd gitrepositories.source.toolkit.fluxcd.io >/dev/null 2>&1; }
+
+cmd_flux_install() {
+  require_management
+  install_flux
+  kubectl_ctx create namespace "$FLUX_NAMESPACE" --dry-run=client -o yaml | kubectl_ctx apply -f -
+  flux_ctx install --namespace="$FLUX_NAMESPACE"
+  kubectl_ctx -n "$FLUX_NAMESPACE" rollout status deploy/source-controller --timeout=180s || true
+  kubectl_ctx -n "$FLUX_NAMESPACE" rollout status deploy/kustomize-controller --timeout=180s || true
+  kubectl_ctx -n "$FLUX_NAMESPACE" rollout status deploy/helm-controller --timeout=180s || true
+  kubectl_ctx -n "$FLUX_NAMESPACE" rollout status deploy/notification-controller --timeout=180s || true
+  ok "Flux installed"
+}
+
+cmd_flux_status() {
+  header
+  require_supervision
+  if ! flux_ns_exists; then warn "Flux namespace not found: $FLUX_NAMESPACE"; return 0; fi
+  kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide || true
+  echo
+  flux_ctx get all -A || true
+}
+
+cmd_flux_health() {
+  require_supervision
+  flux_ctx check || true
+  flux_ctx check --pre || true
+  kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide || true
+}
+
+cmd_flux_logs() {
+  require_supervision
+  local file="$OUTDIR/flux-controller-full-logs.log"
+  : > "$file"
+  for ctrl in source-controller kustomize-controller helm-controller notification-controller image-reflector-controller image-automation-controller; do
+    echo "===== $ctrl =====" >> "$file"
+    if kubectl_ctx -n "$FLUX_NAMESPACE" get deploy "$ctrl" >/dev/null 2>&1; then
+      kubectl_ctx logs -n "$FLUX_NAMESPACE" deploy/"$ctrl" --all-containers=true >> "$file" 2>&1 || true
+    else
+      echo "Deployment not installed: $ctrl" >> "$file"
+    fi
+    echo >> "$file"
+  done
+  ok "Full Flux logs captured: $file"
+  viewer "$file"
+}
+
+cmd_flux_trace() {
+  require_supervision
+  if ! flux_crds_exist; then warn "Flux CRDs missing"; return 0; fi
+  kubectl_ctx get kustomizations -A --no-headers 2>/dev/null | while read -r ns name rest; do
+    echo "===== Kustomization $ns/$name ====="
+    flux_ctx trace kustomization "$name" -n "$ns" || true
+  done
+  kubectl_ctx get gitrepositories -A --no-headers 2>/dev/null | while read -r ns name rest; do
+    echo "===== GitRepository $ns/$name ====="
+    flux_ctx trace source git "$name" -n "$ns" || true
+  done
+}
+
+cmd_flux_bootstrap_github() {
+  require_management
+  [[ -n "$GITHUB_OWNER" && -n "$GITHUB_REPO" && -n "$GITHUB_TOKEN" ]] || die "Set github_owner/github_repo/github_token first"
+  export GITHUB_TOKEN
+  flux_ctx bootstrap github --owner="$GITHUB_OWNER" --repository="$GITHUB_REPO" --branch="$GITHUB_BRANCH" --path="$GITHUB_PATH" --personal --token-auth --namespace="$FLUX_NAMESPACE"
+  audit "flux-bootstrap-github" "$GITHUB_OWNER/$GITHUB_REPO $GITHUB_PATH"
+}
+
+cmd_flux_sync_generic() {
+  require_management
+  [[ -n "$REPO_URL" ]] || die "Set repo_url first"
+  if ! flux_ns_exists; then cmd_flux_install; fi
+
+  cat <<YAML | kubectl_ctx apply -f -
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: ${REPO_NAME}
+  namespace: ${FLUX_NAMESPACE}
+spec:
+  interval: ${SYNC_INTERVAL}
+  url: ${REPO_URL}
+  ref:
+    branch: ${REPO_BRANCH}
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: ${KUSTOMIZATION_NAME}
+  namespace: ${FLUX_NAMESPACE}
+spec:
+  interval: ${SYNC_INTERVAL}
+  retryInterval: ${RETRY_INTERVAL}
+  timeout: ${TIMEOUT}
+  sourceRef:
+    kind: GitRepository
+    name: ${REPO_NAME}
+  path: ./${REPO_PATH}
+  prune: true
+  wait: true
+YAML
+  audit "flux-sync-generic" "$REPO_URL $REPO_PATH"
+  cmd_flux_reconcile
+}
+
+cmd_flux_reconcile() {
+  require_management
+  flux_ctx reconcile source git "$REPO_NAME" -n "$FLUX_NAMESPACE" --with-source || true
+  flux_ctx reconcile kustomization "$KUSTOMIZATION_NAME" -n "$FLUX_NAMESPACE" --with-source || true
+  audit "flux-reconcile" "$REPO_NAME $KUSTOMIZATION_NAME"
+}
+
+cmd_flux_suspend() { require_management; flux_ctx suspend kustomization "$KUSTOMIZATION_NAME" -n "$FLUX_NAMESPACE"; }
+cmd_flux_resume() { require_management; flux_ctx resume kustomization "$KUSTOMIZATION_NAME" -n "$FLUX_NAMESPACE"; }
+
+cmd_flux_delete_sync() {
+  require_management
+  kubectl_ctx delete kustomization "$KUSTOMIZATION_NAME" -n "$FLUX_NAMESPACE" --ignore-not-found
+  kubectl_ctx delete gitrepository "$REPO_NAME" -n "$FLUX_NAMESPACE" --ignore-not-found
+  audit "flux-delete-sync" "$REPO_NAME $KUSTOMIZATION_NAME"
+}
+
+
+cmd_quick_filter() {
+  require_supervision
+  local resource_types=("pods" "deploy" "sts" "ds" "svc" "pvc" "cm" "secret" "events" "all")
+  local rtype filter rc out
+
+  set +e
+  rtype="$(select_from_list "Select quick-filter resource type" "${resource_types[@]}")"
+  rc=$?
+  set -e
+  [[ $rc -eq 0 ]] || { warn "Quick filter cancelled."; return 0; }
+
+  read -r -p "Filter text (blank for all): " filter || true
+  out="$OUTDIR/quick-filter-${ACTIVE_NAMESPACE}-${rtype}.out"
+
+  case "$rtype" in
+    events)
+      kubectl_ctx get events -n "$ACTIVE_NAMESPACE" --sort-by=.lastTimestamp > "$out" 2>&1 || true
+      ;;
+    all)
+      kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide > "$out" 2>&1 || true
+      ;;
+    *)
+      kubectl_ctx get "$rtype" -n "$ACTIVE_NAMESPACE" -o wide > "$out" 2>&1 || true
+      ;;
+  esac
+
+  if [[ -n "$filter" ]]; then
+    grep -i -- "$filter" "$out" > "${out}.filtered" || true
+    mv "${out}.filtered" "$out"
+  fi
+
+  ok "Quick filter output: $out"
+  viewer "$out"
+}
+
+# ------------------------------------------------------------------------------
+# Diagnostics / Audit / Palette
+# ------------------------------------------------------------------------------
+
+cmd_diagnostics() {
+  header
+  require_supervision
+  local out="$DIAG_DIR/diag-$RUN_ID"
+  mkdir -p "$out"
+
+  {
+    echo "date=$(date -Is)"
+    echo "script=$SCRIPT_NAME $SCRIPT_VERSION"
+    echo "mode=$MODE"
+    echo "kubeconfig=$KUBECONFIG_PATH"
+    echo "context=$KUBE_CONTEXT"
+    echo "namespace=$ACTIVE_NAMESPACE"
+    echo "flux_namespace=$FLUX_NAMESPACE"
+  } > "$out/summary.txt"
+
+  kubectl_ctx get nodes -o wide > "$out/nodes.txt" 2>&1 || true
+  kubectl_ctx get ns > "$out/namespaces.txt" 2>&1 || true
+  kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide > "$out/namespace-all.txt" 2>&1 || true
+  kubectl_ctx get events -n "$ACTIVE_NAMESPACE" --sort-by=.lastTimestamp > "$out/namespace-events.txt" 2>&1 || true
+  vcluster list > "$out/vcluster-list.txt" 2>&1 || true
+  flux_ctx check > "$out/flux-check.txt" 2>&1 || true
+  flux_ctx get all -A > "$out/flux-get-all.txt" 2>&1 || true
+  kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide > "$out/flux-pods.txt" 2>&1 || true
+  for ctrl in source-controller kustomize-controller helm-controller notification-controller image-reflector-controller image-automation-controller; do
+    if kubectl_ctx -n "$FLUX_NAMESPACE" get deploy "$ctrl" >/dev/null 2>&1; then
+      kubectl_ctx logs -n "$FLUX_NAMESPACE" deploy/"$ctrl" --all-containers=true > "$out/flux-${ctrl}.log" 2>&1 || true
+    fi
+  done
+
+  tar -czf "$out.tar.gz" -C "$(dirname "$out")" "$(basename "$out")"
+  ok "Diagnostics bundle: $out.tar.gz"
+}
+
+cmd_audit() {
+  [[ -s "$AUDIT_FILE" ]] && viewer "$AUDIT_FILE" || warn "No audit entries yet"
+}
+
+cmd_target_select() {
+  header
+  step "Execution Target Selection"
+  ALLOW_CONTEXT_SWITCH=1 cmd_context_select
+  ALLOW_NAMESPACE_SWITCH=1 cmd_namespace_select
+  ok "Execution target updated"
+}
+
+cmd_palette() {
+  section "Command Palette"
+  cat <<'PAL'
+Supervision:
+  status, k8s-status, k8s-events, k8s-pods, k8s-logs, k8s-describe, k8s-yaml, k8s-top
+  vcluster-status, flux-status, flux-health, flux-logs, flux-trace, diagnostics, audit
+
+Management:
+  vcluster-create, vcluster-delete, vcluster-pause, vcluster-resume
+  flux-install, flux-bootstrap-github, flux-sync-generic, flux-reconcile, flux-suspend, flux-resume
+  k8s-rollout-restart, k8s-scale, pod-delete, pod-force-delete
+PAL
+  echo
+  read -r -p "Run command or blank to cancel: " cmd || true
+  [[ -z "$cmd" ]] && return 0
+  "$0" ${MODE:+--mode "${MODE,,}"} "$cmd"
+}
+
+
+# ------------------------------------------------------------------------------
+# Production startup wizard / selectors
+# ------------------------------------------------------------------------------
+
+list_kubeconfigs() {
+  local files=()
+
+  [[ -n "${KUBECONFIG:-}" ]] && IFS=':' read -ra files <<< "$KUBECONFIG"
+  [[ -f "$HOME/.kube/config" ]] && files+=("$HOME/.kube/config")
+
+  while IFS= read -r f; do
+    files+=("$f")
+  done < <(find "$HOME/.kube" -maxdepth 1 -type f \( -name "*.kubeconfig" -o -name "config" \) 2>/dev/null || true)
+
+  printf '%s\n' "${files[@]}" | awk 'NF' | awk '!seen[$0]++'
+}
+
+cmd_context_select() {
+  header
+  step "Kubeconfig / Context Selection"
+
+  if [[ "${ALLOW_CONTEXT_SWITCH:-0}" != "1" ]]; then
+    warn "Context selection changes the execution target and lock candidate."
+    read -r -p "Continue with context selection? [y/N]: " continue_ctx || true
+    [[ "$continue_ctx" =~ ^[Yy]$ ]] || { warn "Context selection cancelled"; return 0; }
+  fi
+
+  local files=()
+  mapfile -t files < <(list_kubeconfigs)
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    warn "No kubeconfig files detected under ~/.kube."
+    read -r -p "Enter kubeconfig path [$KUBECONFIG_PATH]: " entered || true
+    KUBECONFIG_PATH="${entered:-$KUBECONFIG_PATH}"
+  else
+    echo "Available kubeconfig files:"
+    local i=1
+    for f in "${files[@]}"; do
+      printf '  [%s] %s\n' "$i" "$f"
+      i=$((i+1))
+    done
+
+    read -r -p "Select kubeconfig number or Enter for current [$KUBECONFIG_PATH]: " choice || true
+    if [[ -n "$choice" ]]; then
+      [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid kubeconfig selection"
+      (( choice >= 1 && choice <= ${#files[@]} )) || die "Invalid kubeconfig selection"
+      KUBECONFIG_PATH="${files[$((choice-1))]}"
+    fi
+  fi
+
+  export KUBECONFIG="$KUBECONFIG_PATH"
+  [[ -s "$KUBECONFIG_PATH" ]] || die "Kubeconfig not found: $KUBECONFIG_PATH"
+
+  local contexts=()
+  mapfile -t contexts < <(kubectl config get-contexts -o name 2>/dev/null || true)
+
+  [[ ${#contexts[@]} -gt 0 ]] || die "No contexts found in kubeconfig: $KUBECONFIG_PATH"
+
+  echo
+  echo "Available contexts:"
+  local j=1
+  local current
+  current="$(kubectl config current-context 2>/dev/null || true)"
+
+  for ctx in "${contexts[@]}"; do
+    if [[ "$ctx" == "$current" ]]; then
+      printf '  [%s] %s  %b(current)%b\n' "$j" "$ctx" "$C_GREEN" "$C_RESET"
+    else
+      printf '  [%s] %s\n' "$j" "$ctx"
+    fi
+    j=$((j+1))
+  done
+
+  read -r -p "Select context number or Enter for current [$current]: " ctx_choice || true
+
+  if [[ -n "$ctx_choice" ]]; then
+    [[ "$ctx_choice" =~ ^[0-9]+$ ]] || die "Invalid context selection"
+    (( ctx_choice >= 1 && ctx_choice <= ${#contexts[@]} )) || die "Invalid context selection"
+    KUBE_CONTEXT="${contexts[$((ctx_choice-1))]}"
+  else
+    KUBE_CONTEXT="${KUBE_CONTEXT:-$current}"
+  fi
+
+  [[ -n "$KUBE_CONTEXT" ]] || die "Kubernetes context could not be resolved"
+
+  if ! kubectl --context "$KUBE_CONTEXT" get nodes >/dev/null 2>&1; then
+    warn "Selected context is not reachable: $KUBE_CONTEXT"
+    read -r -p "Continue anyway? [y/N]: " cont || true
+    [[ "$cont" =~ ^[Yy]$ ]] || die "Context selection aborted"
+  fi
+
+  LOCKED_CONTEXT="$KUBE_CONTEXT"
+  LOCKED_CLUSTER_SERVER="$(current_cluster_server "$KUBE_CONTEXT")"
+
+  save_prefs
+  ok "Context selected and saved: $KUBE_CONTEXT"
+}
+
+cmd_namespace_select() {
+  header
+  step "Namespace Selection / Lock"
+
+  if [[ "${ALLOW_NAMESPACE_SWITCH:-0}" != "1" ]]; then
+    warn "Namespace selection changes the namespace lock."
+    read -r -p "Continue with namespace selection? [y/N]: " continue_ns || true
+    [[ "$continue_ns" =~ ^[Yy]$ ]] || { warn "Namespace selection cancelled"; return 0; }
+  fi
+
+  export_kubeconfig
+
+  local namespaces=()
+  if kubectl_ctx get ns >/dev/null 2>&1; then
+    mapfile -t namespaces < <(kubectl_ctx get ns --no-headers 2>/dev/null | awk '{print $1}' | sort)
+  fi
+
+  if [[ ${#namespaces[@]} -eq 0 ]]; then
+    warn "Unable to list namespaces. You can still type a namespace manually."
+    read -r -p "Namespace to lock [${ACTIVE_NAMESPACE:-default}]: " ns || true
+    ACTIVE_NAMESPACE="${ns:-${ACTIVE_NAMESPACE:-default}}"
+  else
+    echo "Available namespaces:"
+    local i=1
+    for ns in "${namespaces[@]}"; do
+      if [[ "$ns" == "$ACTIVE_NAMESPACE" || "$ns" == "$LOCKED_NAMESPACE" ]]; then
+        printf '  [%s] %s  %b(current/locked)%b\n' "$i" "$ns" "$C_GREEN" "$C_RESET"
+      else
+        printf '  [%s] %s\n' "$i" "$ns"
+      fi
+      i=$((i+1))
+    done
+    echo "  [M] Manual namespace"
+
+    read -r -p "Select namespace number, M for manual, or Enter for [$ACTIVE_NAMESPACE]: " choice || true
+
+    if [[ -z "$choice" ]]; then
+      ACTIVE_NAMESPACE="${ACTIVE_NAMESPACE:-default}"
+    elif [[ "$choice" =~ ^[Mm]$ ]]; then
+      read -r -p "Namespace to lock: " manual_ns || true
+      [[ -n "$manual_ns" ]] || die "Namespace cannot be empty"
+      ACTIVE_NAMESPACE="$manual_ns"
+    else
+      [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid namespace selection"
+      (( choice >= 1 && choice <= ${#namespaces[@]} )) || die "Invalid namespace selection"
+      ACTIVE_NAMESPACE="${namespaces[$((choice-1))]}"
+    fi
+  fi
+
+  LOCKED_NAMESPACE="$ACTIVE_NAMESPACE"
+
+  if ! kubectl_ctx get ns "$ACTIVE_NAMESPACE" >/dev/null 2>&1; then
+    warn "Namespace does not exist: $ACTIVE_NAMESPACE"
+    if [[ "$MODE" == "MANAGEMENT" ]]; then
+      read -r -p "Create namespace $ACTIVE_NAMESPACE now? [y/N]: " create_ns || true
+      if [[ "$create_ns" =~ ^[Yy]$ ]]; then
+        kubectl_ctx create namespace "$ACTIVE_NAMESPACE" --dry-run=client -o yaml | kubectl_ctx apply -f -
+        ok "Namespace created: $ACTIVE_NAMESPACE"
+      fi
+    fi
+  fi
+
+  save_prefs
+  audit "namespace-lock" "namespace=$ACTIVE_NAMESPACE"
+  ok "Namespace locked: $ACTIVE_NAMESPACE"
+}
+
+cmd_mode_select() {
+  header
+  step "Execution Mode Selection"
+
+  cat <<'MODE_MENU'
+Select execution mode first:
+
+  [1] SUPERVISION  - read-only, safest default
+  [2] MANAGEMENT   - mutating actions, confirmation gated
+
+MODE_MENU
+
+  read -r -p "Choose mode [1]: " mode_choice || true
+  mode_choice="${mode_choice:-1}"
+
+  case "$mode_choice" in
+    1)
+      MODE="SUPERVISION"
+      ;;
+    2)
+      MODE="MANAGEMENT"
+      echo
+      warn "MANAGEMENT mode can modify the cluster."
+      read -r -p "Type MANAGEMENT to enable management mode: " typed || true
+      [[ "$typed" == "MANAGEMENT" ]] || die "Management mode not enabled"
+      ;;
+    *)
+      die "Invalid mode selection"
+      ;;
+  esac
+
+  ok "Mode selected: $MODE"
+}
+
+cmd_start() {
+  clear_screen
+  banner
+
+  cmd_mode_select
+  ALLOW_CONTEXT_SWITCH=1 cmd_context_select
+  ALLOW_NAMESPACE_SWITCH=1 cmd_namespace_select
+
+  echo
+  ok "Startup control plane completed"
+  cmd_lock_show
+  pause_return
+
+  if [[ "$MODE" == "MANAGEMENT" ]]; then
+    dashboard_management
+  else
+    dashboard_supervision
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# Premium dashboard status + GitOps configuration center
+# ------------------------------------------------------------------------------
+
+count_k8s() {
+  local resource="$1"
+  kubectl_ctx get "$resource" -n "$ACTIVE_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' '
+}
+
+count_flux() {
+  local resource="$1"
+  kubectl_ctx get "$resource" -n "$FLUX_NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' '
+}
+
+safe_short() {
+  local value="${1:-}"
+  local max="${2:-48}"
+  if (( ${#value} > max )); then
+    printf '%s…' "${value:0:max}"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+gitops_provider_summary() {
+  case "${GIT_PROVIDER:-generic}" in
+    github)
+      printf 'GitHub │ %s/%s │ branch=%s │ path=%s' \
+        "${GITHUB_OWNER:-unset}" "${GITHUB_REPO:-unset}" "${GITHUB_BRANCH:-main}" "${GITHUB_PATH:-clusters/dev}"
+      ;;
+    generic)
+      printf 'Generic │ %s │ branch=%s │ path=%s' \
+        "$(safe_short "${REPO_URL:-unset}" 52)" "${REPO_BRANCH:-main}" "${REPO_PATH:-clusters/dev}"
+      ;;
+    *)
+      printf '%s │ not configured' "${GIT_PROVIDER:-unset}"
+      ;;
+  esac
+}
+
+dashboard_snapshot() {
+  load_prefs >/dev/null 2>&1 || true
+
+  local nodes="?"
+  local pods="?"
+  local deploys="?"
+  local svc="?"
+  local flux_pods="?"
+  local gitrepos="?"
+  local kustomizations="?"
+  local vclusters="?"
+
+  if command -v kubectl >/dev/null 2>&1 && [[ -s "${KUBECONFIG_PATH:-}" ]]; then
+    nodes="$(kubectl_ctx get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo '?')"
+    pods="$(count_k8s pods || echo '?')"
+    deploys="$(count_k8s deploy || echo '?')"
+    svc="$(count_k8s svc || echo '?')"
+
+    if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+      flux_pods="$(count_flux pods || echo '?')"
+      gitrepos="$(kubectl_ctx get gitrepositories -A --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo '?')"
+      kustomizations="$(kubectl_ctx get kustomizations -A --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo '?')"
+    else
+      flux_pods="0"
+      gitrepos="0"
+      kustomizations="0"
+    fi
+  fi
+
+  if command -v vcluster >/dev/null 2>&1; then
+    vclusters="$(vcluster list 2>/dev/null | awk 'NR>1 && NF {c++} END{print c+0}' || echo '?')"
+  fi
+
+  local w
+  w="$(term_width)"
+  box_top "$w"
+  box_line " CLUSTER nodes=${nodes} │ NS pods=${pods} deploy=${deploys} svc=${svc} │ vCluster=${vclusters}" "$w"
+  box_line " FLUX ns=${FLUX_NAMESPACE} pods=${flux_pods} gitrepos=${gitrepos} kustomizations=${kustomizations}" "$w"
+  box_line " GITOPS $(gitops_provider_summary)" "$w"
+  box_bottom "$w"
+}
+
+cmd_gitops_status() {
+  header
+  require_supervision
+
+  section "GitOps Configuration"
+  echo "Provider             : ${GIT_PROVIDER}"
+  echo "Flux Namespace       : ${FLUX_NAMESPACE}"
+  echo
+  echo "GitHub Owner         : ${GITHUB_OWNER:-unset}"
+  echo "GitHub Repo          : ${GITHUB_REPO:-unset}"
+  echo "GitHub Branch        : ${GITHUB_BRANCH:-main}"
+  echo "GitHub Path          : ${GITHUB_PATH:-clusters/dev}"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    echo "GitHub Token         : configured (masked)"
+  else
+    echo "GitHub Token         : not configured"
+  fi
+  echo
+  echo "Generic Repo URL     : ${REPO_URL:-unset}"
+  echo "Generic Branch       : ${REPO_BRANCH:-main}"
+  echo "Generic Path         : ${REPO_PATH:-clusters/dev}"
+  echo "GitRepository Name   : ${REPO_NAME:-dheer-gitops-repo}"
+  echo "Kustomization Name   : ${KUSTOMIZATION_NAME:-dheer-gitops}"
+  echo "Sync Interval        : ${SYNC_INTERVAL:-1m}"
+  echo "Retry Interval       : ${RETRY_INTERVAL:-30s}"
+  echo "Timeout              : ${TIMEOUT:-5m}"
+
+  section "Live Flux Sync Status"
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    flux_ctx get all -A || true
+    echo
+    kubectl_ctx get gitrepositories,kustomizations,helmrepositories,helmreleases -A -o wide 2>/dev/null || true
+  else
+    warn "Flux namespace not found: $FLUX_NAMESPACE"
+  fi
+}
+
+read_value() {
+  local prompt="$1"
+  local current="${2:-}"
+  local secret="${3:-0}"
+  local value=""
+
+  if [[ "$secret" == "1" ]]; then
+    if [[ -n "$current" ]]; then
+      read -r -p "$prompt [configured, press Enter to keep]: " value || true
+      if [[ -z "$value" ]]; then
+        printf '%s' "$current"
+      else
+        printf '%s' "$value"
+      fi
+    else
+      read -r -s -p "$prompt: " value || true
+      echo >&2
+      printf '%s' "$value"
+    fi
+  else
+    read -r -p "$prompt [$current]: " value || true
+    printf '%s' "${value:-$current}"
+  fi
+}
+
+cmd_gitops_config() {
+  require_management
+
+  while true; do
+    clear_screen
+    banner
+    status_header
+    dashboard_snapshot
+    cat <<GITMENU
+
+  ${C_BOLD}GITOPS CONFIGURATION CENTER${C_RESET}
+
+  Current:
+    Provider      : ${GIT_PROVIDER}
+    GitHub        : ${GITHUB_OWNER:-unset}/${GITHUB_REPO:-unset} branch=${GITHUB_BRANCH} path=${GITHUB_PATH}
+    Generic Repo  : ${REPO_URL:-unset}
+    Generic Path  : branch=${REPO_BRANCH} path=${REPO_PATH}
+    Flux Objects  : GitRepository=${REPO_NAME} Kustomization=${KUSTOMIZATION_NAME}
+
+  [1] Select provider: GitHub bootstrap
+  [2] Select provider: Generic GitRepository/Kustomization
+  [3] Configure GitHub owner/repo/branch/path/token
+  [4] Configure generic repo URL/branch/path
+  [5] Configure Flux object names and intervals
+  [6] Show live GitOps/Flux status
+  [7] Validate GitOps prerequisites
+  [8] Install Flux controllers
+  [9] Deploy using selected provider
+  [10] Reconcile selected GitOps sync
+  [11] Deploy public repo and commit source-of-truth
+
+  [S] Save and return
+  [Q] Return without further action
+
+GITMENU
+
+    read -r -p "Select GitOps option: " opt || true
+
+    case "${opt}" in
+      1)
+        GIT_PROVIDER="github"
+        ok "Provider set to GitHub bootstrap"
+        pause_return
+        ;;
+      2)
+        GIT_PROVIDER="generic"
+        ok "Provider set to Generic Git sync"
+        pause_return
+        ;;
+      3)
+        GIT_PROVIDER="github"
+        GITHUB_OWNER="$(read_value "GitHub owner/org/user" "${GITHUB_OWNER}")"
+        GITHUB_REPO="$(read_value "GitHub repository" "${GITHUB_REPO}")"
+        GITHUB_BRANCH="$(read_value "GitHub branch" "${GITHUB_BRANCH:-main}")"
+        GITHUB_PATH="$(read_value "GitHub path" "${GITHUB_PATH:-clusters/dev}")"
+        GITHUB_TOKEN="$(read_value "GitHub token" "${GITHUB_TOKEN:-}" 1)"
+        save_prefs
+        pause_return
+        ;;
+      4)
+        GIT_PROVIDER="generic"
+        REPO_URL="$(read_value "Generic Git repo URL" "${REPO_URL}")"
+        REPO_BRANCH="$(read_value "Generic Git branch" "${REPO_BRANCH:-main}")"
+        REPO_PATH="$(read_value "Path inside repo" "${REPO_PATH:-clusters/dev}")"
+        save_prefs
+        pause_return
+        ;;
+      5)
+        REPO_NAME="$(read_value "GitRepository name" "${REPO_NAME:-dheer-gitops-repo}")"
+        KUSTOMIZATION_NAME="$(read_value "Kustomization name" "${KUSTOMIZATION_NAME:-dheer-gitops}")"
+        SYNC_INTERVAL="$(read_value "Sync interval" "${SYNC_INTERVAL:-1m}")"
+        RETRY_INTERVAL="$(read_value "Retry interval" "${RETRY_INTERVAL:-30s}")"
+        TIMEOUT="$(read_value "Timeout" "${TIMEOUT:-5m}")"
+        FLUX_NAMESPACE="$(read_value "Flux namespace" "${FLUX_NAMESPACE:-flux-system}")"
+        save_prefs
+        pause_return
+        ;;
+      6)
+        DHEER_SKIP_READ_CONFIRM=1 cmd_gitops_status
+        pause_return
+        ;;
+      7)
+        cmd_gitops_validate
+        pause_return
+        ;;
+      8)
+        cmd_flux_install
+        pause_return
+        ;;
+      9)
+        cmd_gitops_deploy
+        pause_return
+        ;;
+      10)
+        cmd_flux_reconcile
+        pause_return
+        ;;
+      s|S)
+        save_prefs
+        return 0
+        ;;
+      q|Q)
+        return 0
+        ;;
+      *)
+        warn "Invalid GitOps option"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+cmd_gitops_validate() {
+  operation_summary "GitOps validation"
+
+  local fail=0
+
+  if ! command -v flux >/dev/null 2>&1; then
+    warn "flux CLI missing"
+    fail=1
+  else
+    ok "flux CLI present: $(flux --version 2>/dev/null || true)"
+  fi
+
+  if ! kubectl_ctx get nodes >/dev/null 2>&1; then
+    warn "Kubernetes target not reachable"
+    fail=1
+  else
+    ok "Kubernetes target reachable"
+  fi
+
+  case "$GIT_PROVIDER" in
+    github)
+      [[ -n "$GITHUB_OWNER" ]] || { warn "github_owner missing"; fail=1; }
+      [[ -n "$GITHUB_REPO" ]] || { warn "github_repo missing"; fail=1; }
+      [[ -n "$GITHUB_BRANCH" ]] || { warn "github_branch missing"; fail=1; }
+      [[ -n "$GITHUB_PATH" ]] || { warn "github_path missing"; fail=1; }
+      [[ -n "$GITHUB_TOKEN" ]] || { warn "github_token missing"; fail=1; }
+      ;;
+    generic)
+      [[ -n "$REPO_URL" ]] || { warn "repo_url missing"; fail=1; }
+      [[ -n "$REPO_BRANCH" ]] || { warn "repo_branch missing"; fail=1; }
+      [[ -n "$REPO_PATH" ]] || { warn "repo_path missing"; fail=1; }
+      [[ -n "$REPO_NAME" ]] || { warn "repo_name missing"; fail=1; }
+      [[ -n "$KUSTOMIZATION_NAME" ]] || { warn "kustomization_name missing"; fail=1; }
+      ;;
+    *)
+      warn "Unsupported provider: $GIT_PROVIDER"
+      fail=1
+      ;;
+  esac
+
+  if (( fail == 0 )); then
+    ok "GitOps prerequisites look ready"
+  else
+    warn "GitOps prerequisites incomplete"
+    return 1
+  fi
+}
+
+cmd_gitops_deploy() {
+  require_management
+
+  cmd_gitops_validate || die "GitOps validation failed"
+
+  case "$GIT_PROVIDER" in
+    github)
+      cmd_flux_bootstrap_github
+      ;;
+    generic)
+      cmd_flux_sync_generic
+      ;;
+    *)
+      die "Unsupported GitOps provider: $GIT_PROVIDER"
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Dashboard
+# ------------------------------------------------------------------------------
+
+dashboard_supervision() {
+  while true; do
+    clear_screen
+    banner
+    status_header
+    dashboard_snapshot
+    hotkey_bar_supervision
+    mini_bar
+    cat <<MENU
+  ${C_BOLD}SUPERVISION MODE · READ ONLY${C_RESET}
+
+  [h] Health / Doctor          [s] Platform Status          [n] Namespace Status
+  [p] Pods                     [e] Events                   [l] Full Searchable Logs
+  [d] Describe Resource        [y] Export YAML              [A] App Run Check
+  [F] Forward Status           [O] Output History            [Q] Quick Filter
+  [t] Top Metrics
+  [v] vCluster Status          [Y] vCluster Persistence    [f] Flux Status
+  [F] Flux Health
+  [o] GitOps Status            [L] Flux Full Logs           [T] Flux Trace
+  [x] Diagnostics
+  [a] Audit Log                [k] Lock Details             [c] Context / Namespace
+  [/] Command Palette
+
+  [m] Switch to Management Mode
+  [q] Quit
+MENU
+    echo
+    read -r -p "Select: " opt || true
+    case "$opt" in
+      h|H) cmd_doctor; pause_return ;;
+      s) cmd_status; pause_return ;;
+      n) cmd_k8s_status; pause_return ;;
+      p) cmd_k8s_pods; pause_return ;;
+      e) cmd_k8s_events; pause_return ;;
+      l) cmd_k8s_logs; pause_return ;;
+      d) cmd_k8s_describe; pause_return ;;
+      y) cmd_k8s_yaml; pause_return ;;
+      A) cmd_app_run; pause_return ;;
+      F) cmd_app_port_forward_status; pause_return ;;
+      Q) cmd_quick_filter; pause_return ;;
+      t) cmd_k8s_top; pause_return ;;
+      v) cmd_vcluster_status; pause_return ;;
+      Y) cmd_vcluster_persistence_status; pause_return ;;
+      f) cmd_flux_status; pause_return ;;
+      F) cmd_flux_health; pause_return ;;
+      o) cmd_gitops_status; pause_return ;;
+      L) cmd_flux_logs; pause_return ;;
+      T) cmd_flux_trace; pause_return ;;
+      x) cmd_diagnostics; pause_return ;;
+      a) cmd_audit; pause_return ;;
+      O) cmd_output_history; pause_return ;;
+      k) cmd_lock_show; pause_return ;;
+      c) cmd_target_select; pause_return ;;
+      /) cmd_palette; pause_return ;;
+      m|M) MODE="MANAGEMENT"; dashboard_management ;;
+      q|Q) exit 0 ;;
+      *) warn "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+dashboard_management() {
+  while true; do
+    clear_screen
+    banner
+    status_header
+    dashboard_snapshot
+    hotkey_bar_management
+    mini_bar
+    cat <<MENU
+  ${C_RED}${C_BOLD}MANAGEMENT MODE · MUTATING ACTIONS${C_RESET}
+
+  vCluster:
+    [v] Create vCluster           [D] Delete vCluster        [P] Pause vCluster
+    [R] Resume vCluster           [V] Restore vCluster       [Y] Persistence Setup
+
+  Flux / GitOps:
+    [o] GitOps Configuration      [f] Install Flux           [g] Bootstrap GitHub
+    [G] Sync Generic Repo         [A] Public Repo Deploy     [r] Reconcile
+    [u] Suspend Kustomization     [U] Resume Kustomization   [X] Delete Flux Sync Objects
+
+  Kubernetes / Runtime:
+    [w] Rollout Restart           [z] Scale Workload         [p] Delete Pod
+    [F] Force Delete Pod          [A] App Auto Run+Forward   [B] Start Forward
+    [N] Stop Forward              [M] Forward Status
+
+  Governance:
+    [c] Context / Namespace       [l] Initialize/Update Lock [e] Edit Preferences
+    [O] Output History            [/] Command Palette
+
+  [s] Back to Supervision Mode
+  [q] Quit
+MENU
+    echo
+    read -r -p "Select: " opt || true
+    case "$opt" in
+      v) cmd_vcluster_create; pause_return ;;
+      V) cmd_vcluster_restore; pause_return ;;
+      Y) cmd_vcluster_restore_setup; pause_return ;;
+      D) cmd_vcluster_delete; pause_return ;;
+      P) cmd_vcluster_pause; pause_return ;;
+      R) cmd_vcluster_resume; pause_return ;;
+      o) cmd_gitops_config; pause_return ;;
+      f) cmd_flux_install; pause_return ;;
+      g) cmd_flux_bootstrap_github; pause_return ;;
+      G) cmd_flux_sync_generic; pause_return ;;
+      A) cmd_public_repo_deploy_wizard; pause_return ;;
+      r) cmd_flux_reconcile; pause_return ;;
+      u) cmd_flux_suspend; pause_return ;;
+      U) cmd_flux_resume; pause_return ;;
+      X) cmd_flux_delete_sync; pause_return ;;
+      w) cmd_k8s_rollout_restart; pause_return ;;
+      z) cmd_k8s_scale; pause_return ;;
+      p) cmd_pod_delete; pause_return ;;
+      F) cmd_pod_force_delete; pause_return ;;
+      A) cmd_app_auto; pause_return ;;
+      B) cmd_app_forward; pause_return ;;
+      N) cmd_app_forward_stop; pause_return ;;
+      M) cmd_app_port_forward_status; pause_return ;;
+      c) cmd_target_select; pause_return ;;
+      l) cmd_lock_init; pause_return ;;
+      e) cmd_edit_prefs; pause_return ;;
+      O) cmd_output_history; pause_return ;;
+      /) cmd_palette; pause_return ;;
+      s) MODE="SUPERVISION"; return ;;
+      q|Q) exit 0 ;;
+      *) warn "Invalid option"; sleep 1 ;;
+    esac
+  done
+}
+
+cmd_dashboard() {
+  load_prefs
+  if [[ -z "$LOCKED_CONTEXT" || -z "$LOCKED_CLUSTER_SERVER" ]]; then
+    warn "Execution lock not initialized. Launching production startup wizard."
+    cmd_start
+    return
+  fi
+
+  if [[ "$MODE" == "MANAGEMENT" ]]; then
+    dashboard_management
+  else
+    dashboard_supervision
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# Self-test / static validation
+# ------------------------------------------------------------------------------
+
+cmd_self_test() {
+  DHEER_SKIP_READ_CONFIRM=1
+  header
+  step "Self-test"
+
+  local fail=0
+
+  echo "Script      : $0"
+  echo "Version     : $SCRIPT_VERSION"
+  echo "State dir   : $STATE_DIR"
+  echo "Output dir  : $OUTDIR"
+  echo
+
+  echo "1) Bash syntax"
+  if bash -n "$0"; then
+    ok "bash -n passed"
+  else
+    err "bash -n failed"
+    fail=1
+  fi
+
+  echo
+  echo "2) Required local commands"
+  for c in awk sed grep sort find date mkdir chmod cp mv rm cat tr printf; do
+    if command -v "$c" >/dev/null 2>&1; then
+      ok "$c present"
+    else
+      err "$c missing"
+      fail=1
+    fi
+  done
+
+  echo
+  echo "3) Optional Kubernetes tools"
+  for c in kubectl helm vcluster flux jq curl git less; do
+    if command -v "$c" >/dev/null 2>&1; then
+      ok "$c present"
+    else
+      warn "$c missing; setup can install or validate it"
+    fi
+  done
+
+  echo
+  echo "4) Preference and lock visibility"
+  if [[ -r "$PREF_FILE" ]]; then
+    ok "preferences readable: $PREF_FILE"
+  else
+    warn "preferences not found yet: $PREF_FILE"
+  fi
+
+  echo
+  echo "5) Function alignment"
+  local needed=(
+    cmd_start cmd_dashboard cmd_setup cmd_detect cmd_context_select cmd_namespace_select
+    cmd_lock_init cmd_lock_show cmd_doctor cmd_status cmd_k8s_status cmd_k8s_pods
+    cmd_k8s_events cmd_k8s_logs cmd_k8s_describe cmd_k8s_yaml cmd_vcluster_status
+    cmd_vcluster_create cmd_vcluster_delete cmd_flux_install cmd_flux_status
+    cmd_flux_health cmd_flux_logs cmd_flux_trace cmd_flux_sync_generic cmd_diagnostics
+  )
+
+  local fn
+  for fn in "${needed[@]}"; do
+    if declare -F "$fn" >/dev/null 2>&1; then
+      ok "$fn available"
+    else
+      err "$fn missing"
+      fail=1
+    fi
+  done
+
+  echo
+  echo "6) Current target validation"
+  if [[ -s "$KUBECONFIG_PATH" ]] && command -v kubectl >/dev/null 2>&1; then
+    if kubectl_ctx get nodes >/dev/null 2>&1; then
+      ok "Kubernetes target reachable"
+      kubectl_ctx get nodes -o wide || true
+    else
+      warn "Kubernetes target not reachable with current preferences"
+    fi
+  else
+    warn "Kubernetes target not validated; kubeconfig or kubectl missing"
+  fi
+
+  echo
+  if (( fail == 0 )); then
+    ok "Self-test completed successfully"
+  else
+    die "Self-test found issues"
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# Shortcut installer
+# ------------------------------------------------------------------------------
+
+cmd_install_shortcut() {
+  local target="/usr/local/bin/FLUXONM"
+  local source_path
+  source_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+  echo
+  printf '%b┌─ Install Shortcut %b\n' "$C_CYAN$C_BOLD" "$C_RESET"
+  printf '│ Source : %s\n' "$source_path"
+  printf '│ Target : %s\n' "$target"
+  printf '└──────────────────────────────────────────────────────────────────────────────\n'
+
+  if [[ ! -f "$source_path" ]]; then
+    die "Unable to resolve script path: $source_path"
+  fi
+
+  sudo install -m 0755 "$source_path" "$target"
+
+  ok "Shortcut installed: $target"
+  echo
+  echo "Run directly:"
+  echo "  FLUXONM start"
+  echo "  FLUXONM dashboard"
+  echo "  FLUXONM status"
+}
+
+
+# ------------------------------------------------------------------------------
+# FLUXONM all Git provider engine
+# ------------------------------------------------------------------------------
+
+gitops_supported_providers() {
+  cat <<'PROVIDERS'
+github
+gitlab
+gitea
+bitbucket-server
+generic
+azure-devops
+aws-codecommit
+google-cloud-source
+bitbucket-cloud
+PROVIDERS
+}
+
+gitops_provider_summary() {
+  case "${GIT_PROVIDER:-generic}" in
+    github|gitlab|gitea|bitbucket-server)
+      printf '%s │ %s/%s │ branch=%s │ path=%s │ auth=%s' \
+        "${GIT_PROVIDER}" "${GIT_OWNER:-unset}" "${GIT_REPOSITORY:-unset}" "${GIT_BRANCH:-main}" "${GIT_PATH:-clusters/dev}" "${GIT_AUTH_MODE:-token}"
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      printf '%s │ %s │ branch=%s │ path=%s │ auth=%s' \
+        "${GIT_PROVIDER}" "$(safe_short "${GIT_URL:-unset}" 52)" "${GIT_BRANCH:-main}" "${GIT_PATH:-clusters/dev}" "${GIT_AUTH_MODE:-token}"
+      ;;
+    *)
+      printf '%s │ not configured' "${GIT_PROVIDER:-unset}"
+      ;;
+  esac
+}
+
+mask_secret() {
+  local v="${1:-}"
+  if [[ -z "$v" ]]; then
+    printf 'not configured'
+  else
+    printf 'configured (masked, len=%s)' "${#v}"
+  fi
+}
+
+append_extra_flags() {
+  local -n _arr="$1"
+  if [[ -n "${GIT_EXTRA_FLAGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    local extra=( ${GIT_EXTRA_FLAGS} )
+    _arr+=("${extra[@]}")
+  fi
+}
+
+gitops_build_command_display() {
+  local masked="${1:-masked}"
+  local token="${GIT_TOKEN:-}"
+  local password="${GIT_PASSWORD:-}"
+
+  [[ "$masked" == "masked" ]] && token="***masked***" && password="***masked***"
+
+  case "$GIT_PROVIDER" in
+    github)
+      echo "GITHUB_TOKEN=${token} flux bootstrap github --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}} ${GIT_PERSONAL:+--personal}"
+      ;;
+    gitlab)
+      echo "GITLAB_TOKEN=${token} flux bootstrap gitlab --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}}"
+      ;;
+    gitea)
+      echo "GITEA_TOKEN=${token} flux bootstrap gitea --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}}"
+      ;;
+    bitbucket-server)
+      echo "BITBUCKET_TOKEN=${token} flux bootstrap bitbucket-server --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --hostname=${GIT_HOSTNAME} --username=${GIT_USERNAME} --token-auth"
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      case "$GIT_AUTH_MODE" in
+        ssh)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --private-key-file=${GIT_PRIVATE_KEY_FILE} ${password:+--password=${password}} ${GIT_EXTRA_FLAGS}"
+          ;;
+        bearer)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --password=${token} --with-bearer-token ${GIT_EXTRA_FLAGS}"
+          ;;
+        basic|token)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --username=${GIT_USERNAME} --password=${token} ${GIT_EXTRA_FLAGS}"
+          ;;
+        none)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} ${GIT_EXTRA_FLAGS}"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+cmd_gitops_print_command() {
+  header
+  require_supervision
+  section "Generated Bootstrap Command"
+  gitops_build_command_display masked
+}
+
+cmd_gitops_provider_select() {
+  require_management
+
+  local providers=()
+  mapfile -t providers < <(gitops_supported_providers)
+
+  local selected rc
+  set +e
+  selected="$(select_from_list "Select Flux-supported Git provider" "${providers[@]}")"
+  rc=$?
+  set -e
+
+  [[ $rc -eq 0 ]] || { warn "Provider selection cancelled."; return 0; }
+
+  GIT_PROVIDER="$selected"
+
+  case "$GIT_PROVIDER" in
+    github) GIT_AUTH_MODE="token"; GIT_HOSTNAME="${GIT_HOSTNAME:-github.com}" ;;
+    gitlab) GIT_AUTH_MODE="token"; GIT_HOSTNAME="${GIT_HOSTNAME:-gitlab.com}" ;;
+    gitea) GIT_AUTH_MODE="token" ;;
+    bitbucket-server) GIT_AUTH_MODE="token" ;;
+    azure-devops) GIT_AUTH_MODE="ssh" ;;
+    aws-codecommit) GIT_AUTH_MODE="ssh" ;;
+    google-cloud-source) GIT_AUTH_MODE="ssh" ;;
+    bitbucket-cloud) GIT_AUTH_MODE="basic" ;;
+    generic) GIT_AUTH_MODE="${GIT_AUTH_MODE:-token}" ;;
+  esac
+
+  save_prefs
+  ok "Git provider selected: $GIT_PROVIDER"
+}
+
+cmd_gitops_status() {
+  header
+  require_supervision
+
+  section "GitOps Configuration"
+  echo "Provider             : ${GIT_PROVIDER}"
+  echo "Flux Namespace       : ${FLUX_NAMESPACE}"
+  echo "Auth Mode            : ${GIT_AUTH_MODE}"
+  echo "Hostname             : ${GIT_HOSTNAME:-default/provider URL}"
+  echo
+  echo "Owner/Group/Project  : ${GIT_OWNER:-unset}"
+  echo "Repository           : ${GIT_REPOSITORY:-unset}"
+  echo "Branch               : ${GIT_BRANCH:-main}"
+  echo "Path                 : ${GIT_PATH:-clusters/dev}"
+  echo "Username             : ${GIT_USERNAME:-git}"
+  echo "Token/PAT            : $(mask_secret "${GIT_TOKEN:-}")"
+  echo "Password/Passphrase  : $(mask_secret "${GIT_PASSWORD:-}")"
+  echo "Private Key File     : ${GIT_PRIVATE_KEY_FILE:-unset}"
+  echo "Generic URL          : ${GIT_URL:-unset}"
+  echo "Personal Owner       : ${GIT_PERSONAL:-false}"
+  echo "Private Repo         : ${GIT_PRIVATE:-true}"
+  echo "Extra Flags          : ${GIT_EXTRA_FLAGS:-none}"
+  echo
+  echo "Flux Objects:"
+  echo "GitRepository Name   : ${REPO_NAME:-dheer-gitops-repo}"
+  echo "Kustomization Name   : ${KUSTOMIZATION_NAME:-dheer-gitops}"
+  echo "Sync Interval        : ${SYNC_INTERVAL:-1m}"
+  echo "Retry Interval       : ${RETRY_INTERVAL:-30s}"
+  echo "Timeout              : ${TIMEOUT:-5m}"
+
+  section "Generated Bootstrap Command"
+  gitops_build_command_display masked
+
+  section "Live Flux Sync Status"
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    flux_ctx get all -A || true
+    echo
+    kubectl_ctx get gitrepositories,kustomizations,helmrepositories,helmreleases -A -o wide 2>/dev/null || true
+  else
+    warn "Flux namespace not found: $FLUX_NAMESPACE"
+  fi
+}
+
+cmd_gitops_config_common() {
+  GIT_BRANCH="$(read_value "Git branch" "${GIT_BRANCH:-main}")"
+  GIT_PATH="$(read_value "Flux path in repo" "${GIT_PATH:-clusters/dev}")"
+  FLUX_NAMESPACE="$(read_value "Flux namespace" "${FLUX_NAMESPACE:-flux-system}")"
+  GIT_AUTH_MODE="$(read_value "Auth mode: token | ssh | basic | bearer | none" "${GIT_AUTH_MODE:-token}")"
+  GIT_EXTRA_FLAGS="$(read_value "Extra flux flags (optional)" "${GIT_EXTRA_FLAGS:-}")"
+}
+
+cmd_gitops_config_forge() {
+  GIT_OWNER="$(read_value "Owner / org / group / project" "${GIT_OWNER:-${GITHUB_OWNER:-}}")"
+  GIT_REPOSITORY="$(read_value "Repository name" "${GIT_REPOSITORY:-${GITHUB_REPO:-}}")"
+  GIT_HOSTNAME="$(read_value "Hostname" "${GIT_HOSTNAME:-}")"
+  GIT_USERNAME="$(read_value "Username" "${GIT_USERNAME:-git}")"
+  GIT_TOKEN="$(read_value "Token / PAT" "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" 1)"
+  GIT_PERSONAL="$(read_value "Personal owner? true/false" "${GIT_PERSONAL:-false}")"
+  GIT_PRIVATE="$(read_value "Private repo? true/false" "${GIT_PRIVATE:-true}")"
+  cmd_gitops_config_common
+
+  # Keep old variable compatibility.
+  GITHUB_OWNER="$GIT_OWNER"
+  GITHUB_REPO="$GIT_REPOSITORY"
+  GITHUB_BRANCH="$GIT_BRANCH"
+  GITHUB_PATH="$GIT_PATH"
+  GITHUB_TOKEN="$GIT_TOKEN"
+}
+
+cmd_gitops_config_git_url() {
+  GIT_URL="$(read_value "Git repository URL" "${GIT_URL:-${REPO_URL:-}}")"
+  GIT_USERNAME="$(read_value "Username" "${GIT_USERNAME:-git}")"
+  GIT_TOKEN="$(read_value "Token/PAT/password if needed" "${GIT_TOKEN:-}" 1)"
+  GIT_PRIVATE_KEY_FILE="$(read_value "SSH private key file if SSH" "${GIT_PRIVATE_KEY_FILE:-}")"
+  GIT_PASSWORD="$(read_value "SSH passphrase/password if needed" "${GIT_PASSWORD:-}" 1)"
+  GIT_WITH_BEARER_TOKEN="$(read_value "Use bearer token? true/false" "${GIT_WITH_BEARER_TOKEN:-false}")"
+  cmd_gitops_config_common
+
+  # Keep old generic compatibility.
+  REPO_URL="$GIT_URL"
+  REPO_BRANCH="$GIT_BRANCH"
+  REPO_PATH="$GIT_PATH"
+}
+
+cmd_gitops_config_objects() {
+  REPO_NAME="$(read_value "GitRepository object name" "${REPO_NAME:-dheer-gitops-repo}")"
+  KUSTOMIZATION_NAME="$(read_value "Kustomization object name" "${KUSTOMIZATION_NAME:-dheer-gitops}")"
+  SYNC_INTERVAL="$(read_value "Sync interval" "${SYNC_INTERVAL:-1m}")"
+  RETRY_INTERVAL="$(read_value "Retry interval" "${RETRY_INTERVAL:-30s}")"
+  TIMEOUT="$(read_value "Timeout" "${TIMEOUT:-5m}")"
+  save_prefs
+}
+
+cmd_gitops_validate() {
+  operation_summary "GitOps validation"
+
+  local fail=0
+
+  command -v flux >/dev/null 2>&1 && ok "flux CLI present: $(flux --version 2>/dev/null || true)" || { warn "flux CLI missing"; fail=1; }
+  kubectl_ctx get nodes >/dev/null 2>&1 && ok "Kubernetes target reachable" || { warn "Kubernetes target not reachable"; fail=1; }
+
+  case "$GIT_PROVIDER" in
+    github|gitlab|gitea)
+      [[ -n "$GIT_OWNER" ]] || { warn "git owner/group missing"; fail=1; }
+      [[ -n "$GIT_REPOSITORY" ]] || { warn "git repository missing"; fail=1; }
+      [[ -n "$GIT_BRANCH" ]] || { warn "git branch missing"; fail=1; }
+      [[ -n "$GIT_PATH" ]] || { warn "git path missing"; fail=1; }
+      [[ "$GIT_AUTH_MODE" != "token" || -n "$GIT_TOKEN" ]] || { warn "token/PAT missing"; fail=1; }
+      ;;
+    bitbucket-server)
+      [[ -n "$GIT_OWNER" ]] || { warn "Bitbucket project/user missing"; fail=1; }
+      [[ -n "$GIT_REPOSITORY" ]] || { warn "Bitbucket repository missing"; fail=1; }
+      [[ -n "$GIT_HOSTNAME" ]] || { warn "Bitbucket Server hostname missing"; fail=1; }
+      [[ -n "$GIT_USERNAME" ]] || { warn "Bitbucket username missing"; fail=1; }
+      [[ "$GIT_AUTH_MODE" != "token" || -n "$GIT_TOKEN" ]] || { warn "Bitbucket token missing"; fail=1; }
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      [[ -n "$GIT_URL" ]] || { warn "git URL missing"; fail=1; }
+      [[ -n "$GIT_BRANCH" ]] || { warn "git branch missing"; fail=1; }
+      [[ -n "$GIT_PATH" ]] || { warn "git path missing"; fail=1; }
+      if [[ "$GIT_AUTH_MODE" == "ssh" && -z "$GIT_PRIVATE_KEY_FILE" ]]; then
+        warn "SSH auth selected but private key file is missing"
+        fail=1
+      fi
+      ;;
+    *)
+      warn "Unsupported Git provider: $GIT_PROVIDER"
+      fail=1
+      ;;
+  esac
+
+  if (( fail == 0 )); then
+    ok "GitOps prerequisites look ready"
+  else
+    warn "GitOps prerequisites incomplete"
+    return 1
+  fi
+}
+
+cmd_gitops_deploy() {
+  require_management
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" || -n "${GITOPS_COMMIT_BRANCH:-}" || -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    sync_gitops_bootstrap_vars
+  fi
+  cmd_gitops_validate || die "GitOps validation failed"
+
+  local cmd=()
+
+  case "$GIT_PROVIDER" in
+    github)
+      export GITHUB_TOKEN="$GIT_TOKEN"
+      cmd=(flux bootstrap github --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" && "$GIT_HOSTNAME" != "github.com" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      [[ "$GIT_PRIVATE" == "false" ]] && cmd+=(--private=false)
+      append_extra_flags cmd
+      ;;
+    gitlab)
+      export GITLAB_TOKEN="$GIT_TOKEN"
+      cmd=(flux bootstrap gitlab --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" && "$GIT_HOSTNAME" != "gitlab.com" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+    gitea)
+      export GITEA_TOKEN="$GIT_TOKEN"
+      cmd=(flux bootstrap gitea --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+    bitbucket-server)
+      export BITBUCKET_TOKEN="$GIT_TOKEN"
+      cmd=(flux bootstrap bitbucket-server --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE" --hostname="$GIT_HOSTNAME" --username="$GIT_USERNAME")
+      [[ "$GIT_AUTH_MODE" == "token" ]] && cmd+=(--token-auth)
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      cmd=(flux bootstrap git --url="$GIT_URL" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      case "$GIT_AUTH_MODE" in
+        ssh)
+          cmd+=(--private-key-file="$GIT_PRIVATE_KEY_FILE")
+          [[ -n "$GIT_PASSWORD" ]] && cmd+=(--password="$GIT_PASSWORD")
+          ;;
+        bearer)
+          cmd+=(--password="$GIT_TOKEN" --with-bearer-token)
+          ;;
+        basic|token)
+          cmd+=(--username="$GIT_USERNAME" --password="$GIT_TOKEN")
+          ;;
+        none)
+          ;;
+      esac
+      append_extra_flags cmd
+      ;;
+  esac
+
+  show_command_preview "Flux GitOps deploy" "${cmd[@]}"
+  "${cmd[@]}"
+  audit "gitops-deploy" "provider=$GIT_PROVIDER"
+}
+
+cmd_gitops_config() {
+  require_management
+
+  while true; do
+    clear_screen
+    banner
+    status_header
+    dashboard_snapshot
+    cat <<GITMENU
+
+  ${C_BOLD}GITOPS PROVIDER CONTROL CENTER${C_RESET}
+
+  Current Provider : ${GIT_PROVIDER}
+  Current Summary  : $(gitops_provider_summary)
+
+  Providers supported by this dashboard:
+    github | gitlab | gitea | bitbucket-server | generic
+    azure-devops | aws-codecommit | google-cloud-source | bitbucket-cloud
+
+  [1] Select provider
+  [2] Configure forge provider: GitHub/GitLab/Gitea/Bitbucket Server
+  [3] Configure URL provider: Generic/Azure/AWS/Google/Bitbucket Cloud
+  [4] Configure Flux object names and intervals
+  [5] Show live GitOps status
+  [6] Validate GitOps prerequisites
+  [7] Print generated bootstrap command
+  [8] Install Flux controllers
+  [9] Deploy using selected provider
+  [10] Reconcile selected GitOps sync
+  [11] Deploy public repo and commit source-of-truth
+
+  [S] Save and return
+  [Q] Return
+
+GITMENU
+
+    read -r -p "Select GitOps option: " opt || true
+
+    case "${opt}" in
+      1) cmd_gitops_provider_select; pause_return ;;
+      2) cmd_gitops_config_forge; save_prefs; pause_return ;;
+      3) cmd_gitops_config_git_url; save_prefs; pause_return ;;
+      4) cmd_gitops_config_objects; pause_return ;;
+      5) DHEER_SKIP_READ_CONFIRM=1 cmd_gitops_status; pause_return ;;
+      6) cmd_gitops_validate; pause_return ;;
+      7) DHEER_SKIP_READ_CONFIRM=1 cmd_gitops_print_command; pause_return ;;
+      8) cmd_flux_install; pause_return ;;
+      9) cmd_gitops_deploy; pause_return ;;
+      10) cmd_flux_reconcile; pause_return ;;
+      11) cmd_public_repo_deploy_wizard; pause_return ;;
+      s|S) save_prefs; return 0 ;;
+      q|Q) return 0 ;;
+      *) warn "Invalid GitOps option"; sleep 1 ;;
+    esac
+  done
+}
+
+
+cmd_flux_bootstrap_github() {
+  require_management
+  GIT_PROVIDER="github"
+  if [[ -z "${GIT_OWNER:-}" && -n "${GITHUB_OWNER:-}" ]]; then GIT_OWNER="$GITHUB_OWNER"; fi
+  if [[ -z "${GIT_REPOSITORY:-}" && -n "${GITHUB_REPO:-}" ]]; then GIT_REPOSITORY="$GITHUB_REPO"; fi
+  if [[ -z "${GIT_TOKEN:-}" && -n "${GITHUB_TOKEN:-}" ]]; then GIT_TOKEN="$GITHUB_TOKEN"; fi
+  GIT_BRANCH="${GIT_BRANCH:-${GITHUB_BRANCH:-main}}"
+  GIT_PATH="${GIT_PATH:-${GITHUB_PATH:-clusters/dev}}"
+  cmd_gitops_deploy
+}
+
+cmd_flux_sync_generic() {
+  require_management
+  GIT_PROVIDER="${GIT_PROVIDER:-generic}"
+  if [[ -z "${GIT_URL:-}" && -n "${REPO_URL:-}" ]]; then GIT_URL="$REPO_URL"; fi
+  GIT_BRANCH="${GIT_BRANCH:-${REPO_BRANCH:-main}}"
+  GIT_PATH="${GIT_PATH:-${REPO_PATH:-clusters/dev}}"
+  cmd_gitops_deploy
+}
+
+
+# ------------------------------------------------------------------------------
+# Public repository deployment with GitOps source-of-truth commit
+# ------------------------------------------------------------------------------
+
+sanitize_dns_name() {
+  local raw="${1:-app}"
+  printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/--+/-/g' | cut -c1-63
+}
+
+
+# ------------------------------------------------------------------------------
+# Public repo deployment guardrails
+# ------------------------------------------------------------------------------
+
+looks_like_git_url() {
+  local v="${1:-}"
+  [[ "$v" =~ ^https?:// || "$v" =~ ^ssh:// || "$v" =~ ^git@ || "$v" == *.git ]]
+}
+
+looks_like_branch_name() {
+  local v="${1:-}"
+  [[ -n "$v" && ! "$v" =~ ^https?:// && ! "$v" =~ ^ssh:// && ! "$v" =~ [[:space:]] && ! "$v" == *.git ]]
+}
+
+read_branch_guarded() {
+  local prompt="$1"
+  local current="${2:-main}"
+  local value=""
+  while true; do
+    value="$(read_value "$prompt" "$current")"
+    if looks_like_git_url "$value"; then
+      warn "You entered a Git URL where a branch name is expected: $value"
+      warn "Branch should be a simple value like: main, master, develop"
+      echo
+      read -r -p "Use 'main' as branch and treat this as GitOps repo URL? [Y/n]: " fix || true
+      fix="${fix:-Y}"
+      if [[ "$fix" =~ ^[Yy]$ ]]; then
+        GITOPS_COMMIT_REPO_URL="$value"
+        value="main"
+        break
+      fi
+      continue
+    fi
+    if looks_like_branch_name "$value"; then
+      break
+    fi
+    warn "Invalid branch value: $value"
+  done
+  printf '%s' "$value"
+}
+
+sync_gitops_bootstrap_vars() {
+  # Public repo workflow owns the source-of-truth repo URL/branch/path.
+  # Keep all generic Flux bootstrap variables aligned before validation/deploy.
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]]; then
+    GIT_URL="$GITOPS_COMMIT_REPO_URL"
+    REPO_URL="$GITOPS_COMMIT_REPO_URL"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_BRANCH:-}" ]]; then
+    GIT_BRANCH="$GITOPS_COMMIT_BRANCH"
+    REPO_BRANCH="$GITOPS_COMMIT_BRANCH"
+    GITHUB_BRANCH="$GITOPS_COMMIT_BRANCH"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    GIT_PATH="$GITOPS_COMMIT_PATH"
+    REPO_PATH="$GITOPS_COMMIT_PATH"
+    GITHUB_PATH="$GITOPS_COMMIT_PATH"
+  fi
+
+  # If no provider-specific bootstrap is configured, generic git is the safest universal path.
+  if [[ -z "${GIT_PROVIDER:-}" || "${GIT_PROVIDER:-generic}" == "generic" ]]; then
+    GIT_PROVIDER="generic"
+    GIT_AUTH_MODE="${GIT_AUTH_MODE:-token}"
+  fi
+}
+
+validate_public_repo_inputs() {
+  local fail=0
+
+  [[ -n "${PUBLIC_APP_NAME:-}" ]] || { warn "Application name missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_NAMESPACE:-}" ]] || { warn "Application namespace missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_URL:-}" ]] || { warn "Public repo URL missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_BRANCH:-}" ]] || { warn "Public repo branch missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_PATH:-}" ]] || { warn "Public repo path missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]] || { warn "Your GitOps repo clone URL missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_BRANCH:-}" ]] || { warn "Your GitOps repo branch missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_PATH:-}" ]] || { warn "GitOps source-of-truth path missing"; fail=1; }
+
+  if looks_like_git_url "${GITOPS_COMMIT_BRANCH:-}"; then
+    warn "GitOps branch contains a Git URL: $GITOPS_COMMIT_BRANCH"
+    warn "Fix: branch should be main/master/develop; URL belongs in GitOps repo clone URL."
+    fail=1
+  fi
+
+  if ! looks_like_git_url "${GITOPS_COMMIT_REPO_URL:-}"; then
+    warn "GitOps repo clone URL does not look like a Git URL: ${GITOPS_COMMIT_REPO_URL:-unset}"
+    fail=1
+  fi
+
+  (( fail == 0 ))
+}
+
+print_public_repo_examples() {
+  echo
+  echo "Recommended public demo app:"
+  echo "  Application name       : podinfo-demo"
+  echo "  Namespace              : podinfo-demo"
+  echo "  Public Git repo URL    : https://github.com/stefanprodan/podinfo"
+  echo "  Public repo branch     : master"
+  echo "  Public repo path       : ./kustomize"
+  echo
+  echo "Your GitOps repo example:"
+  echo "  GitOps repo branch     : main"
+  echo "  GitOps repo path       : clusters/dev"
+  echo "  GitOps repo clone URL  : https://github.com/<your-user>/<your-gitops-repo>.git"
+  echo
+}
+
+cmd_public_repo_status() {
+  header
+  require_supervision
+
+  section "Public Repo Deployment Configuration"
+  echo "App Name             : ${PUBLIC_APP_NAME:-unset}"
+  echo "App Namespace        : ${PUBLIC_APP_NAMESPACE:-unset}"
+  echo "Public Repo URL      : ${PUBLIC_APP_REPO_URL:-unset}"
+  echo "Public Repo Branch   : ${PUBLIC_APP_REPO_BRANCH:-main}"
+  echo "Public Repo Path     : ${PUBLIC_APP_REPO_PATH:-./}"
+  echo "Interval             : ${PUBLIC_APP_INTERVAL:-1m}"
+  echo "Timeout              : ${PUBLIC_APP_TIMEOUT:-5m}"
+  echo
+  echo "GitOps Commit Repo   : ${GITOPS_COMMIT_REPO_URL:-auto/from provider if possible}"
+  echo "GitOps Commit Branch : ${GITOPS_COMMIT_BRANCH:-${GIT_BRANCH:-main}}"
+  echo "GitOps Commit Path   : ${GITOPS_COMMIT_PATH:-${GIT_PATH:-clusters/dev}}"
+  echo "Commit User          : ${GIT_COMMIT_USER_NAME:-FLUXONM Bot} <${GIT_COMMIT_USER_EMAIL:-fluxonm@example.local}>"
+
+  section "Live Status"
+  if kubectl_ctx get ns "${PUBLIC_APP_NAMESPACE:-public-demo}" >/dev/null 2>&1; then
+    kubectl_ctx get all -n "${PUBLIC_APP_NAMESPACE}" -o wide || true
+  else
+    warn "Application namespace not present yet: ${PUBLIC_APP_NAMESPACE:-public-demo}"
+  fi
+  echo
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    kubectl_ctx get gitrepository,kustomization -n "$FLUX_NAMESPACE" 2>/dev/null | grep -E "NAME|${PUBLIC_APP_NAME:-public-demo}" || true
+  fi
+}
+
+derive_gitops_commit_url() {
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]]; then
+    printf '%s' "$GITOPS_COMMIT_REPO_URL"
+    return 0
+  fi
+
+  case "${GIT_PROVIDER:-generic}" in
+    github)
+      printf 'https://github.com/%s/%s.git' "$GIT_OWNER" "$GIT_REPOSITORY"
+      ;;
+    gitlab)
+      local host="${GIT_HOSTNAME:-gitlab.com}"
+      printf 'https://%s/%s/%s.git' "$host" "$GIT_OWNER" "$GIT_REPOSITORY"
+      ;;
+    gitea)
+      local host="${GIT_HOSTNAME}"
+      [[ -n "$host" ]] || return 1
+      printf 'https://%s/%s/%s.git' "$host" "$GIT_OWNER" "$GIT_REPOSITORY"
+      ;;
+    *)
+      [[ -n "${GIT_URL:-}" ]] && printf '%s' "$GIT_URL" || return 1
+      ;;
+  esac
+}
+
+authenticated_git_url() {
+  local url="$1"
+  local token="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+  local user="${GIT_USERNAME:-git}"
+
+  if [[ -z "$token" || "$url" != https://* ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+
+  case "${GIT_PROVIDER:-generic}" in
+    github)
+      printf '%s' "$url" | sed "s#https://#https://x-access-token:${token}@#"
+      ;;
+    gitlab|gitea)
+      printf '%s' "$url" | sed "s#https://#https://oauth2:${token}@#"
+      ;;
+    *)
+      printf '%s' "$url" | sed "s#https://#https://${user}:${token}@#"
+      ;;
+  esac
+}
+
+mask_git_url() {
+  local url="$1"
+  printf '%s' "$url" | sed -E 's#(https://)[^/@]+@#\1***masked***@#'
+}
+
+ensure_root_kustomization_has_resource() {
+  local kfile="$1"
+  local resource="$2"
+
+  mkdir -p "$(dirname "$kfile")"
+  if [[ ! -f "$kfile" ]]; then
+    cat > "$kfile" <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - gotk-components.yaml
+  - gotk-sync.yaml
+  - ${resource}
+EOF
+    return 0
+  fi
+
+  if grep -qE "^[[:space:]]*-[[:space:]]*${resource}([[:space:]]*)$" "$kfile"; then
+    return 0
+  fi
+
+  if grep -qE '^resources:' "$kfile"; then
+    awk -v res="$resource" '
+      {print}
+      /^resources:/ && !done {print "  - " res; done=1}
+    ' "$kfile" > "${kfile}.tmp"
+    mv "${kfile}.tmp" "$kfile"
+  else
+    cat >> "$kfile" <<EOF
+
+resources:
+  - ${resource}
+EOF
+  fi
+}
+
+write_public_repo_flux_manifests() {
+  local base="$1"
+  local app
+  app="$(sanitize_dns_name "$PUBLIC_APP_NAME")"
+  local ns
+  ns="$(sanitize_dns_name "$PUBLIC_APP_NAMESPACE")"
+  local appdir="$base/${GITOPS_COMMIT_PATH}/apps/${app}"
+  mkdir -p "$appdir"
+
+  cat > "$appdir/namespace.yaml" <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${ns}
+  labels:
+    app.kubernetes.io/managed-by: fluxonm
+    app.kubernetes.io/part-of: ${app}
+EOF
+
+  cat > "$appdir/source.yaml" <<EOF
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: ${app}-source
+  namespace: ${FLUX_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: fluxonm
+spec:
+  interval: ${PUBLIC_APP_INTERVAL}
+  url: ${PUBLIC_APP_REPO_URL}
+  ref:
+    branch: ${PUBLIC_APP_REPO_BRANCH}
+EOF
+
+  cat > "$appdir/kustomization-app.yaml" <<EOF
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: ${app}
+  namespace: ${FLUX_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: fluxonm
+spec:
+  interval: ${PUBLIC_APP_INTERVAL}
+  retryInterval: 30s
+  timeout: ${PUBLIC_APP_TIMEOUT}
+  sourceRef:
+    kind: GitRepository
+    name: ${app}-source
+  path: ${PUBLIC_APP_REPO_PATH}
+  prune: true
+  wait: true
+  targetNamespace: ${ns}
+EOF
+
+  cat > "$appdir/kustomization.yaml" <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - source.yaml
+  - kustomization-app.yaml
+EOF
+
+  ensure_root_kustomization_has_resource "$base/${GITOPS_COMMIT_PATH}/kustomization.yaml" "apps/${app}"
+}
+
+cmd_public_repo_deploy_wizard() {
+  require_management
+
+  clear_screen
+  banner
+  status_header
+  dashboard_snapshot
+
+  section "Public Repo GitOps Deployment Wizard"
+  echo "This workflow does the following:"
+  echo "  1. Bootstraps Flux into your GitOps repository/path if required"
+  echo "  2. Creates a separate application namespace"
+  echo "  3. Commits GitRepository + Kustomization source-of-truth YAML into your GitOps repo"
+  echo "  4. Pushes the commit"
+  echo "  5. Reconciles Flux so the public repository deploys into your local cluster"
+  echo
+
+  PUBLIC_APP_NAME="$(read_value "Application name" "${PUBLIC_APP_NAME:-public-demo}")"
+  PUBLIC_APP_NAME="$(sanitize_dns_name "$PUBLIC_APP_NAME")"
+  PUBLIC_APP_NAMESPACE="$(read_value "Separate application namespace" "${PUBLIC_APP_NAMESPACE:-${PUBLIC_APP_NAME}}")"
+  PUBLIC_APP_NAMESPACE="$(sanitize_dns_name "$PUBLIC_APP_NAMESPACE")"
+  PUBLIC_APP_REPO_URL="$(read_value "Public Git repo URL to deploy" "${PUBLIC_APP_REPO_URL:-https://github.com/stefanprodan/podinfo}")"
+  PUBLIC_APP_REPO_BRANCH="$(read_value "Public repo branch" "${PUBLIC_APP_REPO_BRANCH:-master}")"
+  PUBLIC_APP_REPO_PATH="$(read_value "Path inside public repo" "${PUBLIC_APP_REPO_PATH:-./kustomize}")"
+  PUBLIC_APP_INTERVAL="$(read_value "Flux sync interval" "${PUBLIC_APP_INTERVAL:-1m}")"
+  PUBLIC_APP_TIMEOUT="$(read_value "Flux deploy timeout" "${PUBLIC_APP_TIMEOUT:-5m}")"
+
+  print_public_repo_examples
+  GITOPS_COMMIT_BRANCH="$(read_branch_guarded "Your GitOps repo branch" "${GITOPS_COMMIT_BRANCH:-${GIT_BRANCH:-main}}")"
+  GITOPS_COMMIT_PATH="$(read_value "New/existing Flux source-of-truth path" "${GITOPS_COMMIT_PATH:-${GIT_PATH:-clusters/dev}}")"
+  GIT_COMMIT_USER_NAME="$(read_value "Git commit user.name" "${GIT_COMMIT_USER_NAME:-FLUXONM Bot}")"
+  GIT_COMMIT_USER_EMAIL="$(read_value "Git commit user.email" "${GIT_COMMIT_USER_EMAIL:-fluxonm@example.local}")"
+
+  local derived_url
+  derived_url="$(derive_gitops_commit_url || true)"
+  GITOPS_COMMIT_REPO_URL="$(read_value "Your GitOps repo clone URL" "${GITOPS_COMMIT_REPO_URL:-$derived_url}")"
+
+  # Guardrail: if user accidentally entered URL in branch prompt, move it to repo URL.
+  if looks_like_git_url "$GITOPS_COMMIT_BRANCH"; then
+    warn "Detected Git URL in branch field. Moving it to GitOps repo URL and resetting branch to main."
+    GITOPS_COMMIT_REPO_URL="$GITOPS_COMMIT_BRANCH"
+    GITOPS_COMMIT_BRANCH="main"
+  fi
+
+  sync_gitops_bootstrap_vars
+
+  if ! validate_public_repo_inputs; then
+    die "Public repo deployment inputs are invalid. Re-run wizard and correct highlighted fields."
+  fi
+
+  save_prefs
+
+  section "Execution Plan Preview"
+  echo "Provider              : ${GIT_PROVIDER}"
+  echo "Cluster Context       : ${KUBE_CONTEXT}"
+  echo "Flux Namespace        : ${FLUX_NAMESPACE}"
+  echo "GitOps Repo           : ${GITOPS_COMMIT_REPO_URL}"
+  echo "GitOps Branch         : ${GITOPS_COMMIT_BRANCH}"
+  echo "GitOps Path           : ${GITOPS_COMMIT_PATH}"
+  echo "App Name              : ${PUBLIC_APP_NAME}"
+  echo "App Namespace         : ${PUBLIC_APP_NAMESPACE}"
+  echo "Public Repo           : ${PUBLIC_APP_REPO_URL}"
+  echo "Public Repo Branch    : ${PUBLIC_APP_REPO_BRANCH}"
+  echo "Public Repo Path      : ${PUBLIC_APP_REPO_PATH}"
+  echo
+  echo "Commands will be previewed before execution and sensitive token values are masked."
+  echo
+  read -r -p "Proceed with full bootstrap + source-of-truth commit + deploy? [y/N]: " proceed || true
+  [[ "$proceed" =~ ^[Yy]$ ]] || { warn "Public repo deployment cancelled"; return 0; }
+
+  section "Step 1: Bootstrap Flux GitOps repo/path"
+  sync_gitops_bootstrap_vars
+  show_command_preview "Flux bootstrap selected provider" bash -lc "$(gitops_build_command_display masked)"
+  read -r -p "Run Flux bootstrap now? [Y/n]: " run_bootstrap || true
+  run_bootstrap="${run_bootstrap:-Y}"
+  if [[ "$run_bootstrap" =~ ^[Yy]$ ]]; then
+    cmd_gitops_deploy
+  else
+    warn "Skipping bootstrap by user choice"
+  fi
+
+  section "Step 2: Clone GitOps repository and write source-of-truth"
+  local workdir clone_url masked_url
+  workdir="$(mktemp -d)"
+  clone_url="$(authenticated_git_url "$GITOPS_COMMIT_REPO_URL")"
+  masked_url="$(mask_git_url "$clone_url")"
+
+  show_command_preview "Clone GitOps repo" git clone --branch "$GITOPS_COMMIT_BRANCH" "$masked_url" "$workdir/repo"
+  git clone --branch "$GITOPS_COMMIT_BRANCH" "$clone_url" "$workdir/repo"
+
+  git -C "$workdir/repo" config user.name "$GIT_COMMIT_USER_NAME"
+  git -C "$workdir/repo" config user.email "$GIT_COMMIT_USER_EMAIL"
+
+  write_public_repo_flux_manifests "$workdir/repo"
+
+  section "Generated source-of-truth files"
+  find "$workdir/repo/${GITOPS_COMMIT_PATH}/apps/${PUBLIC_APP_NAME}" -maxdepth 2 -type f -print | sed 's/^/  /'
+  echo
+  echo "Root kustomization: $workdir/repo/${GITOPS_COMMIT_PATH}/kustomization.yaml"
+
+  section "Git diff preview"
+  git -C "$workdir/repo" status --short
+  git -C "$workdir/repo" diff -- "${GITOPS_COMMIT_PATH}" || true
+
+  echo
+  read -r -p "Commit and push these source-of-truth changes? [y/N]: " commit_push || true
+  [[ "$commit_push" =~ ^[Yy]$ ]] || { warn "Commit/push cancelled; working copy kept at $workdir/repo"; return 0; }
+
+  show_command_preview "Git commit" git add "$GITOPS_COMMIT_PATH" '&&' git commit -m "FLUXONM deploy ${PUBLIC_APP_NAME} from public repo"
+  git -C "$workdir/repo" add "$GITOPS_COMMIT_PATH"
+  if git -C "$workdir/repo" diff --cached --quiet; then
+    warn "No changes to commit"
+  else
+    git -C "$workdir/repo" commit -m "FLUXONM deploy ${PUBLIC_APP_NAME} from public repo"
+  fi
+
+  show_command_preview "Git push" git push origin "$GITOPS_COMMIT_BRANCH"
+  git -C "$workdir/repo" push origin "$GITOPS_COMMIT_BRANCH"
+
+  section "Step 3: Reconcile Flux"
+  if kubectl_ctx get gitrepositories -n "$FLUX_NAMESPACE" flux-system >/dev/null 2>&1; then
+    show_command_preview "Reconcile bootstrap source" flux reconcile source git flux-system -n "$FLUX_NAMESPACE" --with-source
+    flux_ctx reconcile source git flux-system -n "$FLUX_NAMESPACE" --with-source || true
+  fi
+  show_command_preview "Reconcile app source" flux reconcile source git "${PUBLIC_APP_NAME}-source" -n "$FLUX_NAMESPACE" --with-source
+  flux_ctx reconcile source git "${PUBLIC_APP_NAME}-source" -n "$FLUX_NAMESPACE" --with-source || true
+  show_command_preview "Reconcile app kustomization" flux reconcile kustomization "$PUBLIC_APP_NAME" -n "$FLUX_NAMESPACE" --with-source
+  flux_ctx reconcile kustomization "$PUBLIC_APP_NAME" -n "$FLUX_NAMESPACE" --with-source || true
+
+  section "Deployment Status"
+  kubectl_ctx get ns "$PUBLIC_APP_NAMESPACE" || true
+  kubectl_ctx get all -n "$PUBLIC_APP_NAMESPACE" -o wide || true
+  flux_ctx get sources git -n "$FLUX_NAMESPACE" || true
+  flux_ctx get kustomizations -n "$FLUX_NAMESPACE" || true
+
+  audit "public-repo-deploy" "app=${PUBLIC_APP_NAME} ns=${PUBLIC_APP_NAMESPACE} public=${PUBLIC_APP_REPO_URL} gitops=${GITOPS_COMMIT_REPO_URL}/${GITOPS_COMMIT_PATH}"
+  ok "Public repo deployment workflow completed"
+}
+
+
+# ------------------------------------------------------------------------------
+# v5.6.2 Public Repo Hotfix: branch newline + Git auth guardrails
+# ------------------------------------------------------------------------------
+
+trim_one_line() {
+  local v="${1:-}"
+  # Remove CR, convert newlines/tabs to nothing/spaces, trim leading/trailing whitespace.
+  v="$(printf '%s' "$v" | tr -d '\r' | tr -d '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  printf '%s' "$v"
+}
+
+read_branch_guarded() {
+  local prompt="$1"
+  local current="${2:-main}"
+  local value=""
+
+  while true; do
+    value="$(read_value "$prompt" "$current")"
+    value="$(trim_one_line "$value")"
+
+    if looks_like_git_url "$value"; then
+      warn "You entered a Git URL where a branch name is expected: $value"
+      warn "Branch should be a simple value like: main, master, develop"
+      printf '\n' >&2
+      read -r -p "Use 'main' as branch and treat this as GitOps repo URL? [Y/n]: " fix || true
+      fix="${fix:-Y}"
+      if [[ "$fix" =~ ^[Yy]$ ]]; then
+        GITOPS_COMMIT_REPO_URL="$value"
+        value="main"
+        break
+      fi
+      continue
+    fi
+
+    if looks_like_branch_name "$value"; then
+      break
+    fi
+
+    warn "Invalid branch value: $value"
+  done
+
+  printf '%s' "$value"
+}
+
+normalize_gitops_inputs() {
+  PUBLIC_APP_NAME="$(trim_one_line "${PUBLIC_APP_NAME:-}")"
+  PUBLIC_APP_NAMESPACE="$(trim_one_line "${PUBLIC_APP_NAMESPACE:-}")"
+  PUBLIC_APP_REPO_URL="$(trim_one_line "${PUBLIC_APP_REPO_URL:-}")"
+  PUBLIC_APP_REPO_BRANCH="$(trim_one_line "${PUBLIC_APP_REPO_BRANCH:-}")"
+  PUBLIC_APP_REPO_PATH="$(trim_one_line "${PUBLIC_APP_REPO_PATH:-}")"
+  GITOPS_COMMIT_REPO_URL="$(trim_one_line "${GITOPS_COMMIT_REPO_URL:-}")"
+  GITOPS_COMMIT_BRANCH="$(trim_one_line "${GITOPS_COMMIT_BRANCH:-}")"
+  GITOPS_COMMIT_PATH="$(trim_one_line "${GITOPS_COMMIT_PATH:-}")"
+  GIT_URL="$(trim_one_line "${GIT_URL:-}")"
+  REPO_URL="$(trim_one_line "${REPO_URL:-}")"
+  GIT_BRANCH="$(trim_one_line "${GIT_BRANCH:-}")"
+  REPO_BRANCH="$(trim_one_line "${REPO_BRANCH:-}")"
+  GIT_PATH="$(trim_one_line "${GIT_PATH:-}")"
+  REPO_PATH="$(trim_one_line "${REPO_PATH:-}")"
+}
+
+sync_gitops_bootstrap_vars() {
+  normalize_gitops_inputs
+
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]]; then
+    GIT_URL="$GITOPS_COMMIT_REPO_URL"
+    REPO_URL="$GITOPS_COMMIT_REPO_URL"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_BRANCH:-}" ]]; then
+    GIT_BRANCH="$GITOPS_COMMIT_BRANCH"
+    REPO_BRANCH="$GITOPS_COMMIT_BRANCH"
+    GITHUB_BRANCH="$GITOPS_COMMIT_BRANCH"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    GIT_PATH="$GITOPS_COMMIT_PATH"
+    REPO_PATH="$GITOPS_COMMIT_PATH"
+    GITHUB_PATH="$GITOPS_COMMIT_PATH"
+  fi
+
+  if [[ -z "${GIT_PROVIDER:-}" || "${GIT_PROVIDER:-generic}" == "generic" ]]; then
+    GIT_PROVIDER="generic"
+    GIT_AUTH_MODE="${GIT_AUTH_MODE:-token}"
+  fi
+
+  normalize_gitops_inputs
+}
+
+need_git_write_credentials() {
+  # Bootstrap + commit/push require write access for HTTPS repos.
+  case "${GIT_AUTH_MODE:-token}" in
+    token|basic|bearer)
+      [[ -n "${GIT_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]]
+      ;;
+    ssh)
+      [[ -n "${GIT_PRIVATE_KEY_FILE:-}" ]]
+      ;;
+    none)
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+validate_public_repo_inputs() {
+  normalize_gitops_inputs
+  local fail=0
+
+  [[ -n "${PUBLIC_APP_NAME:-}" ]] || { warn "Application name missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_NAMESPACE:-}" ]] || { warn "Application namespace missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_URL:-}" ]] || { warn "Public repo URL missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_BRANCH:-}" ]] || { warn "Public repo branch missing"; fail=1; }
+  [[ -n "${PUBLIC_APP_REPO_PATH:-}" ]] || { warn "Public repo path missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]] || { warn "Your GitOps repo clone URL missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_BRANCH:-}" ]] || { warn "Your GitOps repo branch missing"; fail=1; }
+  [[ -n "${GITOPS_COMMIT_PATH:-}" ]] || { warn "GitOps source-of-truth path missing"; fail=1; }
+
+  if looks_like_git_url "${GITOPS_COMMIT_BRANCH:-}"; then
+    warn "GitOps branch contains a Git URL: $GITOPS_COMMIT_BRANCH"
+    warn "Fix: branch should be main/master/develop; URL belongs in GitOps repo clone URL."
+    fail=1
+  fi
+
+  if ! looks_like_branch_name "${GITOPS_COMMIT_BRANCH:-}"; then
+    warn "GitOps branch is invalid: ${GITOPS_COMMIT_BRANCH:-unset}"
+    fail=1
+  fi
+
+  if ! looks_like_git_url "${GITOPS_COMMIT_REPO_URL:-}"; then
+    warn "GitOps repo clone URL does not look like a Git URL: ${GITOPS_COMMIT_REPO_URL:-unset}"
+    fail=1
+  fi
+
+  if [[ "${GITOPS_COMMIT_REPO_URL:-}" =~ ^https://github.com/ ]] && ! need_git_write_credentials; then
+    warn "GitHub HTTPS GitOps repo requires write credentials for bootstrap/commit/push."
+    warn "Set a GitHub token with repo write access:"
+    warn "  FLUXONM --mode management set git_token '<github-token>'"
+    warn "or use the GitOps wizard to enter token/PAT."
+    fail=1
+  fi
+
+  (( fail == 0 ))
+}
+
+cmd_gitops_validate() {
+  operation_summary "GitOps validation"
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" || -n "${GITOPS_COMMIT_BRANCH:-}" || -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    sync_gitops_bootstrap_vars
+  else
+    normalize_gitops_inputs
+  fi
+
+  local fail=0
+
+  command -v flux >/dev/null 2>&1 && ok "flux CLI present: $(flux --version 2>/dev/null || true)" || { warn "flux CLI missing"; fail=1; }
+  kubectl_ctx get nodes >/dev/null 2>&1 && ok "Kubernetes target reachable" || { warn "Kubernetes target not reachable"; fail=1; }
+
+  case "$GIT_PROVIDER" in
+    github|gitlab|gitea)
+      [[ -n "$GIT_OWNER" ]] || { warn "git owner/group missing"; fail=1; }
+      [[ -n "$GIT_REPOSITORY" ]] || { warn "git repository missing"; fail=1; }
+      [[ -n "$GIT_BRANCH" ]] || { warn "git branch missing"; fail=1; }
+      [[ -n "$GIT_PATH" ]] || { warn "git path missing"; fail=1; }
+      [[ "$GIT_AUTH_MODE" != "token" || -n "$GIT_TOKEN" || -n "$GITHUB_TOKEN" ]] || { warn "token/PAT missing"; fail=1; }
+      ;;
+    bitbucket-server)
+      [[ -n "$GIT_OWNER" ]] || { warn "Bitbucket project/user missing"; fail=1; }
+      [[ -n "$GIT_REPOSITORY" ]] || { warn "Bitbucket repository missing"; fail=1; }
+      [[ -n "$GIT_HOSTNAME" ]] || { warn "Bitbucket Server hostname missing"; fail=1; }
+      [[ -n "$GIT_USERNAME" ]] || { warn "Bitbucket username missing"; fail=1; }
+      [[ "$GIT_AUTH_MODE" != "token" || -n "$GIT_TOKEN" ]] || { warn "Bitbucket token missing"; fail=1; }
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      [[ -n "$GIT_URL" ]] || { warn "git URL missing"; fail=1; }
+      [[ -n "$GIT_BRANCH" ]] || { warn "git branch missing"; fail=1; }
+      [[ -n "$GIT_PATH" ]] || { warn "git path missing"; fail=1; }
+      if ! looks_like_branch_name "$GIT_BRANCH"; then
+        warn "git branch is invalid: $GIT_BRANCH"
+        fail=1
+      fi
+      if [[ "$GIT_AUTH_MODE" == "ssh" && -z "$GIT_PRIVATE_KEY_FILE" ]]; then
+        warn "SSH auth selected but private key file is missing"
+        fail=1
+      fi
+      if [[ "$GIT_AUTH_MODE" =~ ^(token|basic|bearer)$ && "$GIT_URL" =~ ^https://github.com/ && -z "$GIT_TOKEN" && -z "$GITHUB_TOKEN" ]]; then
+        warn "GitHub HTTPS bootstrap requires token/PAT for write access"
+        fail=1
+      fi
+      ;;
+    *)
+      warn "Unsupported Git provider: $GIT_PROVIDER"
+      fail=1
+      ;;
+  esac
+
+  if (( fail == 0 )); then
+    ok "GitOps prerequisites look ready"
+  else
+    warn "GitOps prerequisites incomplete"
+    return 1
+  fi
+}
+
+
+cmd_git_token_prompt() {
+  require_management
+  echo
+  warn "Token input is hidden and will not be printed."
+  read -r -s -p "Enter Git token/PAT: " token_value || true
+  echo
+  [[ -n "$token_value" ]] || die "Token cannot be empty"
+  GIT_TOKEN="$token_value"
+  GITHUB_TOKEN="$token_value"
+  save_prefs
+  ok "Git token saved securely in FLUXONM preferences"
+}
+
+
+# ------------------------------------------------------------------------------
+# v5.6.3 Set-key + token persistence final overrides
+# ------------------------------------------------------------------------------
+
+normalize_gitops_inputs() {
+  PUBLIC_APP_NAME="$(trim_one_line "${PUBLIC_APP_NAME:-}")"
+  PUBLIC_APP_NAMESPACE="$(trim_one_line "${PUBLIC_APP_NAMESPACE:-}")"
+  PUBLIC_APP_REPO_URL="$(trim_one_line "${PUBLIC_APP_REPO_URL:-}")"
+  PUBLIC_APP_REPO_BRANCH="$(trim_one_line "${PUBLIC_APP_REPO_BRANCH:-}")"
+  PUBLIC_APP_REPO_PATH="$(trim_one_line "${PUBLIC_APP_REPO_PATH:-}")"
+  GITOPS_COMMIT_REPO_URL="$(trim_one_line "${GITOPS_COMMIT_REPO_URL:-}")"
+  GITOPS_COMMIT_BRANCH="$(trim_one_line "${GITOPS_COMMIT_BRANCH:-}")"
+  GITOPS_COMMIT_PATH="$(trim_one_line "${GITOPS_COMMIT_PATH:-}")"
+  GIT_URL="$(trim_one_line "${GIT_URL:-}")"
+  REPO_URL="$(trim_one_line "${REPO_URL:-}")"
+  GIT_BRANCH="$(trim_one_line "${GIT_BRANCH:-}")"
+  REPO_BRANCH="$(trim_one_line "${REPO_BRANCH:-}")"
+  GIT_PATH="$(trim_one_line "${GIT_PATH:-}")"
+  REPO_PATH="$(trim_one_line "${REPO_PATH:-}")"
+  GIT_TOKEN="$(trim_one_line "${GIT_TOKEN:-${GITHUB_TOKEN:-}}")"
+  GITHUB_TOKEN="$(trim_one_line "${GITHUB_TOKEN:-${GIT_TOKEN:-}}")"
+  GIT_USERNAME="$(trim_one_line "${GIT_USERNAME:-git}")"
+  GIT_AUTH_MODE="$(trim_one_line "${GIT_AUTH_MODE:-token}")"
+}
+
+sync_gitops_bootstrap_vars() {
+  normalize_gitops_inputs
+
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" ]]; then
+    GIT_URL="$GITOPS_COMMIT_REPO_URL"
+    REPO_URL="$GITOPS_COMMIT_REPO_URL"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_BRANCH:-}" ]]; then
+    GIT_BRANCH="$GITOPS_COMMIT_BRANCH"
+    REPO_BRANCH="$GITOPS_COMMIT_BRANCH"
+    GITHUB_BRANCH="$GITOPS_COMMIT_BRANCH"
+  fi
+
+  if [[ -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    GIT_PATH="$GITOPS_COMMIT_PATH"
+    REPO_PATH="$GITOPS_COMMIT_PATH"
+    GITHUB_PATH="$GITOPS_COMMIT_PATH"
+  fi
+
+  if [[ -n "${GIT_TOKEN:-}" ]]; then
+    GITHUB_TOKEN="$GIT_TOKEN"
+  elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    GIT_TOKEN="$GITHUB_TOKEN"
+  fi
+
+  if [[ -z "${GIT_PROVIDER:-}" || "${GIT_PROVIDER:-generic}" == "generic" ]]; then
+    GIT_PROVIDER="generic"
+    GIT_AUTH_MODE="${GIT_AUTH_MODE:-basic}"
+  fi
+
+  normalize_gitops_inputs
+}
+
+
+# ------------------------------------------------------------------------------
+# v5.7 final overrides: management session + universal set keys
+# ------------------------------------------------------------------------------
+
+management_session_is_active() {
+  [[ "${MODE:-SUPERVISION}" == "MANAGEMENT" ]] || return 1
+
+  # CLI management mode is explicit and sufficient for non-destructive config commands.
+  # Dashboard management mode should not repeatedly ask to type MANAGEMENT.
+  return 0
+}
+
+confirm_management() {
+  # No repeated typed prompt once user has explicitly selected --mode management
+  # or entered Management Mode in dashboard.
+  if management_session_is_active; then
+    return 0
+  fi
+
+  echo
+  warn "MANAGEMENT action requested"
+  info "Context   : ${LOCKED_CONTEXT}"
+  info "Namespace : ${LOCKED_NAMESPACE}"
+  read -r -p "Type MANAGEMENT to continue: " typed || true
+  [[ "$typed" == "MANAGEMENT" ]]
+}
+
+require_management() {
+  validate_lock
+  if declare -F operation_summary >/dev/null 2>&1; then
+    operation_summary "${FUNCNAME[1]:-management-operation}"
+  fi
+  [[ "$MODE" == "MANAGEMENT" ]] || die "Blocked. Use: $SCRIPT_NAME --mode management <command>"
+  confirm_management || die "Management confirmation failed"
+}
+
+cmd_set() {
+  require_management
+
+  local key="${1:-}"
+  local value="${2:-}"
+
+  [[ -n "$key" && -n "$value" ]] || die "Usage: $SCRIPT_NAME --mode management set KEY VALUE"
+
+  case "$key" in
+    kubeconfig) KUBECONFIG_PATH="$value" ;;
+    context) KUBE_CONTEXT="$value" ;;
+    namespace) ACTIVE_NAMESPACE="$value"; LOCKED_NAMESPACE="$value" ;;
+    flux_namespace) FLUX_NAMESPACE="$value" ;;
+    provider) GIT_PROVIDER="$value" ;;
+
+    vcluster_name) VCLUSTER_NAME="$value"; VCLUSTER_KUBECONFIG="$HOME/.kube/${value}.kubeconfig" ;;
+    vcluster_version) VCLUSTER_K8S_VERSION="$value" ;;
+    vcluster_distro) VCLUSTER_DISTRO="$value" ;;
+
+    flux_cli_version) FLUX_CLI_VERSION="$value" ;;
+
+    # Legacy GitHub keys
+    github_owner) GITHUB_OWNER="$value"; GIT_OWNER="$value" ;;
+    github_repo) GITHUB_REPO="$value"; GIT_REPOSITORY="$value" ;;
+    github_branch) GITHUB_BRANCH="$value"; GIT_BRANCH="$value" ;;
+    github_path) GITHUB_PATH="$value"; GIT_PATH="$value" ;;
+    github_token) GITHUB_TOKEN="$value"; GIT_TOKEN="$value" ;;
+
+    # Legacy generic keys
+    repo_url) REPO_URL="$value"; GIT_URL="$value"; GITOPS_COMMIT_REPO_URL="$value" ;;
+    repo_branch) REPO_BRANCH="$value"; GIT_BRANCH="$value"; GITOPS_COMMIT_BRANCH="$value" ;;
+    repo_path) REPO_PATH="$value"; GIT_PATH="$value"; GITOPS_COMMIT_PATH="$value" ;;
+    repo_name) REPO_NAME="$value" ;;
+    kustomization_name) KUSTOMIZATION_NAME="$value" ;;
+    interval) SYNC_INTERVAL="$value" ;;
+    retry_interval) RETRY_INTERVAL="$value" ;;
+    timeout) TIMEOUT="$value" ;;
+
+    # Universal GitOps keys
+    git_provider) GIT_PROVIDER="$value" ;;
+    git_hostname) GIT_HOSTNAME="$value" ;;
+    git_owner) GIT_OWNER="$value"; GITHUB_OWNER="$value" ;;
+    git_repository|git_repo) GIT_REPOSITORY="$value"; GITHUB_REPO="$value" ;;
+    git_branch) GIT_BRANCH="$value"; REPO_BRANCH="$value"; GITHUB_BRANCH="$value"; GITOPS_COMMIT_BRANCH="$value" ;;
+    git_path) GIT_PATH="$value"; REPO_PATH="$value"; GITHUB_PATH="$value"; GITOPS_COMMIT_PATH="$value" ;;
+    git_username) GIT_USERNAME="$value" ;;
+    git_token) GIT_TOKEN="$value"; GITHUB_TOKEN="$value" ;;
+    git_url) GIT_URL="$value"; REPO_URL="$value"; GITOPS_COMMIT_REPO_URL="$value" ;;
+    git_auth_mode) GIT_AUTH_MODE="$value" ;;
+    git_private_key_file) GIT_PRIVATE_KEY_FILE="$value" ;;
+    git_password) GIT_PASSWORD="$value" ;;
+    git_personal) GIT_PERSONAL="$value" ;;
+    git_private) GIT_PRIVATE="$value" ;;
+    git_with_bearer_token) GIT_WITH_BEARER_TOKEN="$value" ;;
+    git_extra_flags) GIT_EXTRA_FLAGS="$value" ;;
+
+    # Public repo workflow keys
+    gitops_repo_url) GITOPS_COMMIT_REPO_URL="$value"; GIT_URL="$value"; REPO_URL="$value" ;;
+    gitops_branch) GITOPS_COMMIT_BRANCH="$value"; GIT_BRANCH="$value"; REPO_BRANCH="$value" ;;
+    gitops_path) GITOPS_COMMIT_PATH="$value"; GIT_PATH="$value"; REPO_PATH="$value" ;;
+    public_app_name) PUBLIC_APP_NAME="$value" ;;
+    public_app_namespace) PUBLIC_APP_NAMESPACE="$value" ;;
+    public_repo_url) PUBLIC_APP_REPO_URL="$value" ;;
+    public_repo_branch) PUBLIC_APP_REPO_BRANCH="$value" ;;
+    public_repo_path) PUBLIC_APP_REPO_PATH="$value" ;;
+
+    *) die "Unsupported key: $key" ;;
+  esac
+
+  if declare -F normalize_gitops_inputs >/dev/null 2>&1; then
+    normalize_gitops_inputs
+  fi
+
+  save_prefs
+  audit "set" "key=$key"
+  ok "Set $key"
+}
+
+cmd_git_token_prompt() {
+  require_management
+  echo
+  warn "Token input is hidden and will not be printed."
+  read -r -s -p "Enter Git token/PAT: " token_value || true
+  echo
+  [[ -n "$token_value" ]] || die "Token cannot be empty"
+
+  GIT_TOKEN="$token_value"
+  GITHUB_TOKEN="$token_value"
+
+  if [[ -z "${GIT_AUTH_MODE:-}" || "${GIT_AUTH_MODE:-token}" == "token" ]]; then
+    GIT_AUTH_MODE="basic"
+  fi
+
+  save_prefs
+  ok "Git token saved securely in FLUXONM preferences"
+}
+
+cmd_gitops_quick_setup() {
+  require_management
+
+  echo
+  section "GitOps Quick Setup"
+  echo "This configures your GitOps repo URL, branch, path, username, auth mode, and token."
+  echo
+
+  GIT_PROVIDER="${GIT_PROVIDER:-generic}"
+  GIT_URL="$(read_value "GitOps repo HTTPS/SSH URL" "${GIT_URL:-${REPO_URL:-}}")"
+  GIT_BRANCH="$(read_value "GitOps branch" "${GIT_BRANCH:-${REPO_BRANCH:-main}}")"
+  GIT_PATH="$(read_value "GitOps path" "${GIT_PATH:-${REPO_PATH:-clusters/dev}}")"
+  GIT_USERNAME="$(read_value "Git username" "${GIT_USERNAME:-git}")"
+  GIT_AUTH_MODE="$(read_value "Auth mode: basic | token | ssh | bearer | none" "${GIT_AUTH_MODE:-basic}")"
+
+  if [[ "$GIT_AUTH_MODE" =~ ^(basic|token|bearer)$ ]]; then
+    echo
+    warn "Token input is hidden and will not be printed."
+    read -r -s -p "Enter token/PAT: " GIT_TOKEN || true
+    echo
+    GITHUB_TOKEN="$GIT_TOKEN"
+  elif [[ "$GIT_AUTH_MODE" == "ssh" ]]; then
+    GIT_PRIVATE_KEY_FILE="$(read_value "SSH private key file" "${GIT_PRIVATE_KEY_FILE:-$HOME/.ssh/id_rsa}")"
+  fi
+
+  REPO_URL="$GIT_URL"
+  REPO_BRANCH="$GIT_BRANCH"
+  REPO_PATH="$GIT_PATH"
+  GITOPS_COMMIT_REPO_URL="$GIT_URL"
+  GITOPS_COMMIT_BRANCH="$GIT_BRANCH"
+  GITOPS_COMMIT_PATH="$GIT_PATH"
+
+  save_prefs
+  ok "GitOps quick setup completed"
+}
+
+cmd_gitops_status() {
+  header
+  DHEER_SKIP_READ_CONFIRM=1 require_supervision
+
+  section "GitOps Configuration"
+  echo "Provider             : ${GIT_PROVIDER:-generic}"
+  echo "Flux Namespace       : ${FLUX_NAMESPACE:-flux-system}"
+  echo "Auth Mode            : ${GIT_AUTH_MODE:-unset}"
+  echo "Hostname             : ${GIT_HOSTNAME:-default/provider URL}"
+  echo
+  echo "Owner/Group/Project  : ${GIT_OWNER:-unset}"
+  echo "Repository           : ${GIT_REPOSITORY:-unset}"
+  echo "Branch               : ${GIT_BRANCH:-${REPO_BRANCH:-main}}"
+  echo "Path                 : ${GIT_PATH:-${REPO_PATH:-clusters/dev}}"
+  echo "Username             : ${GIT_USERNAME:-git}"
+  echo "Token/PAT            : $(mask_secret "${GIT_TOKEN:-${GITHUB_TOKEN:-}}")"
+  echo "Private Key File     : ${GIT_PRIVATE_KEY_FILE:-unset}"
+  echo "Generic URL          : ${GIT_URL:-${REPO_URL:-unset}}"
+  echo
+  echo "Public Repo Workflow:"
+  echo "GitOps Repo URL      : ${GITOPS_COMMIT_REPO_URL:-unset}"
+  echo "GitOps Branch        : ${GITOPS_COMMIT_BRANCH:-unset}"
+  echo "GitOps Path          : ${GITOPS_COMMIT_PATH:-unset}"
+  echo "Public App           : ${PUBLIC_APP_NAME:-unset}"
+  echo "Public Namespace     : ${PUBLIC_APP_NAMESPACE:-unset}"
+  echo "Public Repo URL      : ${PUBLIC_APP_REPO_URL:-unset}"
+
+  section "Live Flux Sync Status"
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    flux_ctx get all -A || true
+  else
+    warn "Flux namespace not found: $FLUX_NAMESPACE"
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# v5.8 final override: HTTPS token-auth + secure preview masking
+# ------------------------------------------------------------------------------
+
+mask_cmd_args() {
+  local out=()
+  local prev=""
+  local arg
+  for arg in "$@"; do
+    if [[ "$prev" == "--password" || "$prev" == "-p" || "$prev" == "--token" ]]; then
+      out+=("***masked***")
+    elif [[ "$arg" == --password=* ]]; then
+      out+=("--password=***masked***")
+    elif [[ "$arg" == --token=* ]]; then
+      out+=("--token=***masked***")
+    elif [[ "$arg" == *"${GIT_TOKEN:-__NO_TOKEN__}"* && -n "${GIT_TOKEN:-}" ]]; then
+      out+=("${arg//${GIT_TOKEN}/***masked***}")
+    elif [[ "$arg" == *"${GITHUB_TOKEN:-__NO_TOKEN__}"* && -n "${GITHUB_TOKEN:-}" ]]; then
+      out+=("${arg//${GITHUB_TOKEN}/***masked***}")
+    else
+      out+=("$arg")
+    fi
+    prev="$arg"
+  done
+  printf '%q ' "${out[@]}"
+}
+
+show_command_preview_masked() {
+  local title="$1"
+  shift
+  echo
+  printf '%b┌─ Command Preview: %s %b\n' "$C_YELLOW$C_BOLD" "$title" "$C_RESET"
+  printf '│ '
+  mask_cmd_args "$@"
+  echo
+  printf '└──────────────────────────────────────────────────────────────────────────────\n'
+}
+
+cmd_gitops_deploy() {
+  require_management
+
+  if [[ -n "${GITOPS_COMMIT_REPO_URL:-}" || -n "${GITOPS_COMMIT_BRANCH:-}" || -n "${GITOPS_COMMIT_PATH:-}" ]]; then
+    sync_gitops_bootstrap_vars
+  elif declare -F normalize_gitops_inputs >/dev/null 2>&1; then
+    normalize_gitops_inputs
+  fi
+
+  cmd_gitops_validate || die "GitOps validation failed"
+
+  local cmd=()
+
+  case "$GIT_PROVIDER" in
+    github)
+      export GITHUB_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+      cmd=(flux bootstrap github --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" || "$GIT_AUTH_MODE" == "basic" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" && "$GIT_HOSTNAME" != "github.com" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      [[ "$GIT_PRIVATE" == "false" ]] && cmd+=(--private=false)
+      append_extra_flags cmd
+      ;;
+
+    gitlab)
+      export GITLAB_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+      cmd=(flux bootstrap gitlab --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" || "$GIT_AUTH_MODE" == "basic" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" && "$GIT_HOSTNAME" != "gitlab.com" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+
+    gitea)
+      export GITEA_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+      cmd=(flux bootstrap gitea --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      [[ "$GIT_AUTH_MODE" == "token" || "$GIT_AUTH_MODE" == "basic" ]] && cmd+=(--token-auth)
+      [[ -n "$GIT_HOSTNAME" ]] && cmd+=(--hostname="$GIT_HOSTNAME")
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+
+    bitbucket-server)
+      export BITBUCKET_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+      cmd=(flux bootstrap bitbucket-server --owner="$GIT_OWNER" --repository="$GIT_REPOSITORY" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE" --hostname="$GIT_HOSTNAME" --username="$GIT_USERNAME")
+      [[ "$GIT_AUTH_MODE" == "token" || "$GIT_AUTH_MODE" == "basic" ]] && cmd+=(--token-auth)
+      [[ "$GIT_PERSONAL" == "true" ]] && cmd+=(--personal)
+      append_extra_flags cmd
+      ;;
+
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      cmd=(flux bootstrap git --url="$GIT_URL" --branch="$GIT_BRANCH" --path="$GIT_PATH" --namespace="$FLUX_NAMESPACE")
+      case "$GIT_AUTH_MODE" in
+        ssh)
+          cmd+=(--private-key-file="$GIT_PRIVATE_KEY_FILE")
+          [[ -n "$GIT_PASSWORD" ]] && cmd+=(--password="$GIT_PASSWORD")
+          ;;
+        bearer)
+          cmd+=(--password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" --with-bearer-token --token-auth)
+          ;;
+        basic|token)
+          cmd+=(--username="${GIT_USERNAME:-git}" --password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" --token-auth)
+          ;;
+        none)
+          ;;
+      esac
+      append_extra_flags cmd
+      ;;
+    *)
+      die "Unsupported Git provider: $GIT_PROVIDER"
+      ;;
+  esac
+
+  show_command_preview_masked "Flux GitOps deploy" "${cmd[@]}"
+
+  "${cmd[@]}"
+  audit "gitops-deploy" "provider=$GIT_PROVIDER"
+}
+
+gitops_build_command_display() {
+  local masked="${1:-masked}"
+  local token="${GIT_TOKEN:-${GITHUB_TOKEN:-}}"
+  local password="${GIT_PASSWORD:-}"
+
+  [[ "$masked" == "masked" ]] && token="***masked***" && password="***masked***"
+
+  case "$GIT_PROVIDER" in
+    github)
+      echo "GITHUB_TOKEN=${token} flux bootstrap github --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}} ${GIT_PERSONAL:+--personal}"
+      ;;
+    gitlab)
+      echo "GITLAB_TOKEN=${token} flux bootstrap gitlab --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}}"
+      ;;
+    gitea)
+      echo "GITEA_TOKEN=${token} flux bootstrap gitea --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --token-auth ${GIT_HOSTNAME:+--hostname=${GIT_HOSTNAME}}"
+      ;;
+    bitbucket-server)
+      echo "BITBUCKET_TOKEN=${token} flux bootstrap bitbucket-server --owner=${GIT_OWNER} --repository=${GIT_REPOSITORY} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --hostname=${GIT_HOSTNAME} --username=${GIT_USERNAME} --token-auth"
+      ;;
+    generic|azure-devops|aws-codecommit|google-cloud-source|bitbucket-cloud)
+      case "$GIT_AUTH_MODE" in
+        ssh)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --private-key-file=${GIT_PRIVATE_KEY_FILE} ${password:+--password=${password}} ${GIT_EXTRA_FLAGS}"
+          ;;
+        bearer)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --password=${token} --with-bearer-token --token-auth ${GIT_EXTRA_FLAGS}"
+          ;;
+        basic|token)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} --username=${GIT_USERNAME:-git} --password=${token} --token-auth ${GIT_EXTRA_FLAGS}"
+          ;;
+        none)
+          echo "flux bootstrap git --url=${GIT_URL} --branch=${GIT_BRANCH} --path=${GIT_PATH} --namespace=${FLUX_NAMESPACE} ${GIT_EXTRA_FLAGS}"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+cmd_flux_repair_https_token_auth() {
+  require_management
+
+  sync_gitops_bootstrap_vars
+
+  [[ -n "${GIT_URL:-}" ]] || die "GIT_URL missing. Set git_url first."
+  [[ -n "${GIT_BRANCH:-}" ]] || die "GIT_BRANCH missing. Set git_branch first."
+  [[ -n "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "Git token missing. Run: FLUXONM --mode management git-token-prompt"
+
+  section "Repair Flux GitRepository to HTTPS token-auth"
+  show_command_preview_masked "Re-bootstrap with HTTPS token-auth" \
+    flux bootstrap git \
+      --url="$GIT_URL" \
+      --branch="$GIT_BRANCH" \
+      --path="$GIT_PATH" \
+      --namespace="$FLUX_NAMESPACE" \
+      --username="${GIT_USERNAME:-git}" \
+      --password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+      --token-auth
+
+  read -r -p "Run HTTPS token-auth repair now? [Y/n]: " ans || true
+  ans="${ans:-Y}"
+  [[ "$ans" =~ ^[Yy]$ ]] || { warn "Repair cancelled"; return 0; }
+
+  flux bootstrap git \
+    --url="$GIT_URL" \
+    --branch="$GIT_BRANCH" \
+    --path="$GIT_PATH" \
+    --namespace="$FLUX_NAMESPACE" \
+    --username="${GIT_USERNAME:-git}" \
+    --password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+    --token-auth
+
+  ok "HTTPS token-auth repair complete"
+}
+
+
+# ------------------------------------------------------------------------------
+# v5.9 final override: no read prompts + actionable public repo status
+# ------------------------------------------------------------------------------
+
+require_supervision() {
+  validate_lock
+  # Read-only operations must never stop the dashboard with confirmation prompts.
+  # Management operations are still gated by mode.
+  return 0
+}
+
+cmd_public_repo_status() {
+  header
+  require_supervision
+
+  section "Public Repo Deployment Configuration"
+  echo "App Name             : ${PUBLIC_APP_NAME:-unset}"
+  echo "App Namespace        : ${PUBLIC_APP_NAMESPACE:-unset}"
+  echo "Public Repo URL      : ${PUBLIC_APP_REPO_URL:-unset}"
+  echo "Public Repo Branch   : ${PUBLIC_APP_REPO_BRANCH:-unset}"
+  echo "Public Repo Path     : ${PUBLIC_APP_REPO_PATH:-unset}"
+  echo "Interval             : ${PUBLIC_APP_INTERVAL:-1m}"
+  echo "Timeout              : ${PUBLIC_APP_TIMEOUT:-5m}"
+  echo
+  echo "GitOps Commit Repo   : ${GITOPS_COMMIT_REPO_URL:-${GIT_URL:-unset}}"
+  echo "GitOps Commit Branch : ${GITOPS_COMMIT_BRANCH:-${GIT_BRANCH:-unset}}"
+  echo "GitOps Commit Path   : ${GITOPS_COMMIT_PATH:-${GIT_PATH:-unset}}"
+  echo "Commit User          : ${GITOPS_COMMIT_USER_NAME:-FLUXONM Bot} <${GITOPS_COMMIT_USER_EMAIL:-fluxonm@example.local}>"
+
+  section "Flux Bootstrap Status"
+  if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+    echo "Flux namespace       : present"
+    kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+    echo
+    echo "Flux GitRepositories:"
+    kubectl_ctx get gitrepositories -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+    echo
+    echo "Flux Kustomizations:"
+    kubectl_ctx get kustomizations -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+  else
+    warn "Flux namespace not present: $FLUX_NAMESPACE"
+  fi
+
+  section "Application Live Status"
+  if [[ -n "${PUBLIC_APP_NAMESPACE:-}" ]] && kubectl_ctx get ns "$PUBLIC_APP_NAMESPACE" >/dev/null 2>&1; then
+    ok "Application namespace present: $PUBLIC_APP_NAMESPACE"
+    kubectl_ctx get all -n "$PUBLIC_APP_NAMESPACE" -o wide 2>/dev/null || true
+    echo
+    kubectl_ctx get events -n "$PUBLIC_APP_NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+  else
+    warn "Application namespace not present yet: ${PUBLIC_APP_NAMESPACE:-unset}"
+    echo
+    echo "This normally means the public repo workflow has not completed after Flux bootstrap."
+    echo
+    echo "Next commands:"
+    echo "  FLUXONM --mode management flux-repair-https"
+    echo "  FLUXONM --mode management public-repo-deploy"
+    echo "  FLUXONM public-repo-status"
+  fi
+
+  section "Troubleshooting Commands"
+  echo "  FLUXONM flux-status"
+  echo "  FLUXONM flux-trace"
+  echo "  kubectl --kubeconfig ${KUBECONFIG_PATH} get gitrepositories,kustomizations -n ${FLUX_NAMESPACE} -o wide"
+  echo "  kubectl --kubeconfig ${KUBECONFIG_PATH} get all -n ${PUBLIC_APP_NAMESPACE:-podinfo-demo} -o wide"
+}
+
+cmd_flux_repair_https_token_auth() {
+  require_management
+
+  sync_gitops_bootstrap_vars
+
+  [[ -n "${GIT_URL:-}" ]] || die "GIT_URL missing. Set git_url first."
+  [[ -n "${GIT_BRANCH:-}" ]] || die "GIT_BRANCH missing. Set git_branch first."
+  [[ -n "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "Git token missing. Run: FLUXONM --mode management git-token-prompt"
+
+  section "Repair Flux GitRepository to HTTPS token-auth"
+  show_command_preview_masked "Re-bootstrap with HTTPS token-auth" \
+    flux bootstrap git \
+      --url="$GIT_URL" \
+      --branch="$GIT_BRANCH" \
+      --path="$GIT_PATH" \
+      --namespace="$FLUX_NAMESPACE" \
+      --username="${GIT_USERNAME:-git}" \
+      --password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+      --token-auth
+
+  flux bootstrap git \
+    --url="$GIT_URL" \
+    --branch="$GIT_BRANCH" \
+    --path="$GIT_PATH" \
+    --namespace="$FLUX_NAMESPACE" \
+    --username="${GIT_USERNAME:-git}" \
+    --password="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+    --token-auth
+
+  ok "HTTPS token-auth repair complete"
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.0 final override: full output capture + safe Flux trace parsing
+# ------------------------------------------------------------------------------
+
+capture_stream() {
+  local label="$1"
+  shift
+  local safe_label
+  safe_label="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/_$//')"
+  local file="$OUTDIR/${safe_label}.log"
+
+  mkdir -p "$OUTDIR"
+
+  {
+    echo "### FLUXONM capture"
+    echo "### label      : $label"
+    echo "### timestamp  : $(date -Is)"
+    echo "### mode       : ${MODE:-unset}"
+    echo "### context    : ${KUBE_CONTEXT:-unset}"
+    echo "### namespace  : ${ACTIVE_NAMESPACE:-unset}"
+    echo "### command    : $*"
+    echo
+    "$@"
+  } 2>&1 | tee "$file"
+
+  local rc=${PIPESTATUS[0]}
+  echo
+  if [[ $rc -eq 0 ]]; then
+    ok "Output captured: $file"
+  else
+    warn "Command exited rc=$rc; output captured: $file"
+  fi
+  return $rc
+}
+
+capture_block() {
+  local label="$1"
+  local safe_label
+  safe_label="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/_$//')"
+  local file="$OUTDIR/${safe_label}.log"
+
+  mkdir -p "$OUTDIR"
+
+  {
+    echo "### FLUXONM capture"
+    echo "### label      : $label"
+    echo "### timestamp  : $(date -Is)"
+    echo "### mode       : ${MODE:-unset}"
+    echo "### context    : ${KUBE_CONTEXT:-unset}"
+    echo "### namespace  : ${ACTIVE_NAMESPACE:-unset}"
+    echo
+    cat
+  } | tee "$file"
+
+  echo
+  ok "Output captured: $file"
+}
+
+cmd_capture-last() {
+  header
+  require_supervision
+  section "Current Run Output Files"
+  find "$OUTDIR" -maxdepth 1 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" 2>/dev/null | sort || true
+  echo
+  echo "All run output is under:"
+  echo "  $OUTDIR"
+}
+
+cmd_status() {
+  header
+  require_supervision
+  {
+    section "Kubernetes"
+    kubectl_ctx get nodes -o wide || true
+
+    section "Namespace: $ACTIVE_NAMESPACE"
+    kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide || true
+
+    section "vCluster"
+    vcluster list 2>/dev/null || true
+
+    section "Flux"
+    if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+      kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide || true
+      flux_ctx get all -A || true
+    else
+      warn "Flux namespace not found: $FLUX_NAMESPACE"
+    fi
+  } | capture_block "status"
+}
+
+cmd_flux_status() {
+  header
+  require_supervision
+  {
+    section "Flux Controller Pods"
+    if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+      kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide || true
+    else
+      warn "Flux namespace not found: $FLUX_NAMESPACE"
+    fi
+
+    section "Flux Objects"
+    flux_ctx get all -A || true
+
+    section "Flux Native Resources"
+    kubectl_ctx get gitrepositories,kustomizations,helmrepositories,helmreleases -A -o wide 2>/dev/null || true
+  } | capture_block "flux-status"
+}
+
+cmd_flux_trace() {
+  header
+  require_supervision
+  {
+    section "Flux Trace"
+
+    if ! kubectl_ctx get crd kustomizations.kustomize.toolkit.fluxcd.io >/dev/null 2>&1; then
+      warn "Flux Kustomization CRD missing"
+    else
+      echo
+      echo "Kustomizations:"
+      kubectl_ctx get kustomizations.kustomize.toolkit.fluxcd.io -A -o wide 2>/dev/null || true
+
+      while IFS=$'\t' read -r ns name; do
+        [[ -n "$ns" && -n "$name" ]] || continue
+        echo
+        echo "===== Kustomization: $ns/$name ====="
+        flux_ctx trace kustomization "$name" -n "$ns" || true
+      done < <(kubectl_ctx get kustomizations.kustomize.toolkit.fluxcd.io -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    fi
+
+    if ! kubectl_ctx get crd gitrepositories.source.toolkit.fluxcd.io >/dev/null 2>&1; then
+      warn "Flux GitRepository CRD missing"
+    else
+      echo
+      echo "GitRepositories:"
+      kubectl_ctx get gitrepositories.source.toolkit.fluxcd.io -A -o wide 2>/dev/null || true
+
+      while IFS=$'\t' read -r ns name; do
+        [[ -n "$ns" && -n "$name" ]] || continue
+        echo
+        echo "===== GitRepository: $ns/$name ====="
+        flux_ctx trace source git "$name" -n "$ns" || true
+      done < <(kubectl_ctx get gitrepositories.source.toolkit.fluxcd.io -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"\t"}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+    fi
+  } | capture_block "flux-trace"
+}
+
+cmd_public_repo_status() {
+  header
+  require_supervision
+
+  {
+    section "Public Repo Deployment Configuration"
+    echo "App Name             : ${PUBLIC_APP_NAME:-unset}"
+    echo "App Namespace        : ${PUBLIC_APP_NAMESPACE:-unset}"
+    echo "Public Repo URL      : ${PUBLIC_APP_REPO_URL:-unset}"
+    echo "Public Repo Branch   : ${PUBLIC_APP_REPO_BRANCH:-unset}"
+    echo "Public Repo Path     : ${PUBLIC_APP_REPO_PATH:-unset}"
+    echo "Interval             : ${PUBLIC_APP_INTERVAL:-1m}"
+    echo "Timeout              : ${PUBLIC_APP_TIMEOUT:-5m}"
+    echo
+    echo "GitOps Commit Repo   : ${GITOPS_COMMIT_REPO_URL:-${GIT_URL:-unset}}"
+    echo "GitOps Commit Branch : ${GITOPS_COMMIT_BRANCH:-${GIT_BRANCH:-unset}}"
+    echo "GitOps Commit Path   : ${GITOPS_COMMIT_PATH:-${GIT_PATH:-unset}}"
+    echo "Commit User          : ${GITOPS_COMMIT_USER_NAME:-FLUXONM Bot} <${GITOPS_COMMIT_USER_EMAIL:-fluxonm@example.local}>"
+
+    section "Flux Bootstrap Status"
+    if kubectl_ctx get ns "$FLUX_NAMESPACE" >/dev/null 2>&1; then
+      echo "Flux namespace       : present"
+      kubectl_ctx get pods -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+      echo
+      echo "Flux GitRepositories:"
+      kubectl_ctx get gitrepositories.source.toolkit.fluxcd.io -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+      echo
+      echo "Flux Kustomizations:"
+      kubectl_ctx get kustomizations.kustomize.toolkit.fluxcd.io -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+    else
+      warn "Flux namespace not present: $FLUX_NAMESPACE"
+    fi
+
+    section "Application Live Status"
+    if [[ -n "${PUBLIC_APP_NAMESPACE:-}" ]] && kubectl_ctx get ns "$PUBLIC_APP_NAMESPACE" >/dev/null 2>&1; then
+      ok "Application namespace present: $PUBLIC_APP_NAMESPACE"
+      kubectl_ctx get all -n "$PUBLIC_APP_NAMESPACE" -o wide 2>/dev/null || true
+      echo
+      kubectl_ctx get events -n "$PUBLIC_APP_NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -50 || true
+    else
+      warn "Application namespace not present yet: ${PUBLIC_APP_NAMESPACE:-unset}"
+      echo
+      echo "Likely root cause if Flux Kustomization is False:"
+      echo "  Missing gotk-components.yaml / gotk-sync.yaml under configured GitOps path."
+      echo
+      echo "Next commands:"
+      echo "  FLUXONM --mode management flux-repair-https"
+      echo "  FLUXONM --mode management public-repo-deploy"
+      echo "  FLUXONM flux-status"
+      echo "  FLUXONM flux-trace"
+    fi
+
+    section "Troubleshooting Commands"
+    echo "  FLUXONM flux-status"
+    echo "  FLUXONM flux-trace"
+    echo "  kubectl --kubeconfig ${KUBECONFIG_PATH} get gitrepositories,kustomizations -n ${FLUX_NAMESPACE} -o wide"
+    echo "  kubectl --kubeconfig ${KUBECONFIG_PATH} get all -n ${PUBLIC_APP_NAMESPACE:-podinfo-demo} -o wide"
+  } | capture_block "public-repo-status"
+}
+
+cmd_k8s_status() {
+  header
+  require_supervision
+  {
+    section "Namespace Objects: $ACTIVE_NAMESPACE"
+    kubectl_ctx get all -n "$ACTIVE_NAMESPACE" -o wide || true
+    echo
+    kubectl_ctx get cm,secret,sa,role,rolebinding,pvc,ingress -n "$ACTIVE_NAMESPACE" -o wide 2>/dev/null || true
+  } | capture_block "k8s-status"
+}
+
+cmd_k8s_events() {
+  header
+  require_supervision
+  kubectl_ctx get events -n "$ACTIVE_NAMESPACE" --sort-by=.lastTimestamp 2>&1 | capture_block "k8s-events"
+}
+
+cmd_k8s_pods() {
+  header
+  require_supervision
+  kubectl_ctx get pods -n "$ACTIVE_NAMESPACE" -o wide 2>&1 | capture_block "k8s-pods"
+}
+
+cmd_vcluster_status() {
+  header
+  require_supervision
+  {
+    vcluster list || true
+    echo
+    docker ps -a --filter "name=vcluster" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
+  } | capture_block "vcluster-status"
+}
+
+cmd_output_bundle() {
+  header
+  require_supervision
+  local bundle="$OUTDIR/fluxonm-output-bundle-$RUN_ID.tar.gz"
+  tar -czf "$bundle" -C "$OUTDIR" . 2>/dev/null || true
+  ok "Output bundle created: $bundle"
+  ls -lh "$bundle" 2>/dev/null || true
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.1 repair: regenerate missing gotk files under Flux sync path
+# ------------------------------------------------------------------------------
+
+git_clone_with_configured_auth() {
+  local repo_url="$1"
+  local branch="$2"
+  local dest="$3"
+
+  rm -rf "$dest"
+
+  if [[ "${GIT_AUTH_MODE:-basic}" == "ssh" ]]; then
+    [[ -n "${GIT_PRIVATE_KEY_FILE:-}" ]] || die "SSH private key file missing"
+    GIT_SSH_COMMAND="ssh -i ${GIT_PRIVATE_KEY_FILE} -o StrictHostKeyChecking=accept-new" \
+      git clone --branch "$branch" "$repo_url" "$dest"
+    return $?
+  fi
+
+  local askpass
+  askpass="$(mktemp)"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' "${GIT_USERNAME:-git}" ;;
+  *Password*) printf '%s\n' "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+  *) printf '\n' ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+    git clone --branch "$branch" "$repo_url" "$dest"
+
+  local rc=$?
+  rm -f "$askpass"
+  return $rc
+}
+
+git_push_with_configured_auth() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  if [[ "${GIT_AUTH_MODE:-basic}" == "ssh" ]]; then
+    GIT_SSH_COMMAND="ssh -i ${GIT_PRIVATE_KEY_FILE} -o StrictHostKeyChecking=accept-new" \
+      git -C "$repo_dir" push origin "$branch"
+    return $?
+  fi
+
+  local askpass
+  askpass="$(mktemp)"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' "${GIT_USERNAME:-git}" ;;
+  *Password*) printf '%s\n' "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+  *) printf '\n' ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+    git -C "$repo_dir" push origin "$branch"
+
+  local rc=$?
+  rm -f "$askpass"
+  return $rc
+}
+
+cmd_flux_repair_gotk_path() {
+  require_management
+  sync_gitops_bootstrap_vars
+
+  [[ -n "${GIT_URL:-}" ]] || die "GIT_URL missing. Set git_url first."
+  [[ -n "${GIT_BRANCH:-}" ]] || die "GIT_BRANCH missing. Set git_branch first."
+  [[ -n "${GIT_PATH:-}" ]] || die "GIT_PATH missing. Set git_path first."
+
+  if [[ "${GIT_AUTH_MODE:-basic}" != "ssh" ]]; then
+    [[ -n "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "Git token missing. Run: FLUXONM --mode management git-token-prompt"
+  fi
+
+  section "Repair missing Flux source-of-truth files"
+  echo "Repo        : $GIT_URL"
+  echo "Branch      : $GIT_BRANCH"
+  echo "Flux path   : $GIT_PATH"
+  echo "Namespace   : $FLUX_NAMESPACE"
+  echo
+  echo "This will regenerate and commit:"
+  echo "  $GIT_PATH/gotk-components.yaml"
+  echo "  $GIT_PATH/gotk-sync.yaml"
+  echo "  $GIT_PATH/kustomization.yaml"
+  echo
+  read -r -p "Proceed with gotk path repair? [Y/n]: " ans || true
+  ans="${ans:-Y}"
+  [[ "$ans" =~ ^[Yy]$ ]] || { warn "Repair cancelled"; return 0; }
+
+  local work repo_dir sync_dir
+  work="$(mktemp -d)"
+  repo_dir="$work/repo"
+
+  section "Clone GitOps repo"
+  echo "Cloning $GIT_URL branch $GIT_BRANCH into temporary workdir"
+  git_clone_with_configured_auth "$GIT_URL" "$GIT_BRANCH" "$repo_dir"
+
+  sync_dir="$repo_dir/$GIT_PATH"
+  mkdir -p "$sync_dir"
+
+  section "Generate gotk-components.yaml"
+  flux install --namespace="$FLUX_NAMESPACE" --export > "$sync_dir/gotk-components.yaml"
+
+  section "Generate gotk-sync.yaml"
+  {
+    flux create source git flux-system \
+      --url="$GIT_URL" \
+      --branch="$GIT_BRANCH" \
+      --interval="${SYNC_INTERVAL:-1m}" \
+      --namespace="$FLUX_NAMESPACE" \
+      --export
+
+    echo "---"
+
+    flux create kustomization flux-system \
+      --source=GitRepository/flux-system \
+      --path="./$GIT_PATH" \
+      --prune=true \
+      --interval="${SYNC_INTERVAL:-1m}" \
+      --timeout="${TIMEOUT:-5m}" \
+      --namespace="$FLUX_NAMESPACE" \
+      --export
+  } > "$sync_dir/gotk-sync.yaml"
+
+  section "Generate root kustomization.yaml"
+  if [[ -f "$sync_dir/kustomization.yaml" ]]; then
+    cp "$sync_dir/kustomization.yaml" "$sync_dir/kustomization.yaml.bak.fluxonm.$(date +%Y%m%d%H%M%S)"
+  fi
+
+  {
+    echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+    echo "kind: Kustomization"
+    echo "resources:"
+    echo "  - gotk-components.yaml"
+    echo "  - gotk-sync.yaml"
+
+    if [[ -d "$sync_dir/apps" ]]; then
+      while IFS= read -r app_dir; do
+        [[ -n "$app_dir" ]] || continue
+        echo "  - apps/$(basename "$app_dir")"
+      done < <(find "$sync_dir/apps" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    fi
+  } > "$sync_dir/kustomization.yaml"
+
+  section "Git diff preview"
+  git -C "$repo_dir" status --short
+  echo
+  git -C "$repo_dir" diff -- "$GIT_PATH" || true
+
+  echo
+  read -r -p "Commit and push gotk path repair? [Y/n]: " commit_ans || true
+  commit_ans="${commit_ans:-Y}"
+  [[ "$commit_ans" =~ ^[Yy]$ ]] || { warn "Commit skipped"; return 0; }
+
+  git -C "$repo_dir" config user.name "${GITOPS_COMMIT_USER_NAME:-FLUXONM Bot}"
+  git -C "$repo_dir" config user.email "${GITOPS_COMMIT_USER_EMAIL:-fluxonm@example.local}"
+
+  git -C "$repo_dir" add "$GIT_PATH"
+
+  if git -C "$repo_dir" diff --cached --quiet; then
+    ok "No changes to commit"
+  else
+    git -C "$repo_dir" commit -m "Repair Flux source-of-truth files under $GIT_PATH"
+    section "Push GitOps repair commit"
+    git_push_with_configured_auth "$repo_dir" "$GIT_BRANCH"
+  fi
+
+  section "Apply and reconcile"
+  kubectl_ctx apply -f "$sync_dir/gotk-components.yaml"
+  kubectl_ctx apply -f "$sync_dir/gotk-sync.yaml"
+
+  flux_ctx reconcile source git flux-system -n "$FLUX_NAMESPACE" || true
+  flux_ctx reconcile kustomization flux-system -n "$FLUX_NAMESPACE" --with-source || true
+
+  ok "GOTK path repair completed"
+
+  echo
+  echo "Next:"
+  echo "  FLUXONM flux-status"
+  echo "  FLUXONM flux-trace"
+  echo "  FLUXONM --mode management public-repo-deploy"
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.2 final override: Git push auth export + clean GOTK repair
+# ------------------------------------------------------------------------------
+
+git_clone_with_configured_auth() {
+  local repo_url="$1"
+  local branch="$2"
+  local dest="$3"
+
+  rm -rf "$dest"
+
+  if [[ "${GIT_AUTH_MODE:-basic}" == "ssh" ]]; then
+    [[ -n "${GIT_PRIVATE_KEY_FILE:-}" ]] || die "SSH private key file missing"
+    GIT_SSH_COMMAND="ssh -i ${GIT_PRIVATE_KEY_FILE} -o StrictHostKeyChecking=accept-new" \
+      git clone --branch "$branch" "$repo_url" "$dest"
+    return $?
+  fi
+
+  local askpass
+  askpass="$(mktemp)"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' "${GIT_USERNAME:-git}" ;;
+  *Password*) printf '%s\n' "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+  *) printf '\n' ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+
+  GIT_USERNAME="${GIT_USERNAME:-git}" \
+  GIT_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+  GITHUB_TOKEN="${GITHUB_TOKEN:-${GIT_TOKEN:-}}" \
+  GIT_ASKPASS="$askpass" \
+  GIT_TERMINAL_PROMPT=0 \
+    git clone --branch "$branch" "$repo_url" "$dest"
+
+  local rc=$?
+  rm -f "$askpass"
+  return $rc
+}
+
+git_push_with_configured_auth() {
+  local repo_dir="$1"
+  local branch="$2"
+
+  if [[ "${GIT_AUTH_MODE:-basic}" == "ssh" ]]; then
+    [[ -n "${GIT_PRIVATE_KEY_FILE:-}" ]] || die "SSH private key file missing"
+    GIT_SSH_COMMAND="ssh -i ${GIT_PRIVATE_KEY_FILE} -o StrictHostKeyChecking=accept-new" \
+      git -C "$repo_dir" push origin "$branch"
+    return $?
+  fi
+
+  local askpass
+  askpass="$(mktemp)"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' "${GIT_USERNAME:-git}" ;;
+  *Password*) printf '%s\n' "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ;;
+  *) printf '\n' ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+
+  GIT_USERNAME="${GIT_USERNAME:-git}" \
+  GIT_TOKEN="${GIT_TOKEN:-${GITHUB_TOKEN:-}}" \
+  GITHUB_TOKEN="${GITHUB_TOKEN:-${GIT_TOKEN:-}}" \
+  GIT_ASKPASS="$askpass" \
+  GIT_TERMINAL_PROMPT=0 \
+    git -C "$repo_dir" push origin "$branch"
+
+  local rc=$?
+  rm -f "$askpass"
+  return $rc
+}
+
+cmd_flux_repair_gotk_path() {
+  require_management
+  sync_gitops_bootstrap_vars
+
+  [[ -n "${GIT_URL:-}" ]] || die "GIT_URL missing. Set git_url first."
+  [[ -n "${GIT_BRANCH:-}" ]] || die "GIT_BRANCH missing. Set git_branch first."
+  [[ -n "${GIT_PATH:-}" ]] || die "GIT_PATH missing. Set git_path first."
+
+  if [[ "${GIT_AUTH_MODE:-basic}" != "ssh" ]]; then
+    [[ -n "${GIT_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "Git token missing. Run: FLUXONM --mode management git-token-prompt"
+  fi
+
+  section "Repair missing Flux source-of-truth files"
+  echo "Repo        : $GIT_URL"
+  echo "Branch      : $GIT_BRANCH"
+  echo "Flux path   : $GIT_PATH"
+  echo "Namespace   : $FLUX_NAMESPACE"
+  echo "Auth mode   : ${GIT_AUTH_MODE:-basic}"
+  echo "Username    : ${GIT_USERNAME:-git}"
+  echo
+  echo "This will regenerate and commit:"
+  echo "  $GIT_PATH/gotk-components.yaml"
+  echo "  $GIT_PATH/gotk-sync.yaml"
+  echo "  $GIT_PATH/kustomization.yaml"
+  echo
+  echo "This will NOT commit backup files (*.bak.fluxonm.*)."
+  echo
+  read -r -p "Proceed with gotk path repair? [Y/n]: " ans || true
+  ans="${ans:-Y}"
+  [[ "$ans" =~ ^[Yy]$ ]] || { warn "Repair cancelled"; return 0; }
+
+  local work repo_dir sync_dir
+  work="$(mktemp -d)"
+  repo_dir="$work/repo"
+
+  section "Clone GitOps repo"
+  echo "Cloning $GIT_URL branch $GIT_BRANCH into temporary workdir"
+  git_clone_with_configured_auth "$GIT_URL" "$GIT_BRANCH" "$repo_dir"
+
+  sync_dir="$repo_dir/$GIT_PATH"
+  mkdir -p "$sync_dir"
+
+  section "Generate gotk-components.yaml"
+  flux install --namespace="$FLUX_NAMESPACE" --export > "$sync_dir/gotk-components.yaml"
+
+  section "Generate gotk-sync.yaml"
+  {
+    flux create source git flux-system \
+      --url="$GIT_URL" \
+      --branch="$GIT_BRANCH" \
+      --interval="${SYNC_INTERVAL:-1m}" \
+      --namespace="$FLUX_NAMESPACE" \
+      --export
+
+    echo "---"
+
+    flux create kustomization flux-system \
+      --source=GitRepository/flux-system \
+      --path="./$GIT_PATH" \
+      --prune=true \
+      --interval="${SYNC_INTERVAL:-1m}" \
+      --timeout="${TIMEOUT:-5m}" \
+      --namespace="$FLUX_NAMESPACE" \
+      --export
+  } > "$sync_dir/gotk-sync.yaml"
+
+  section "Generate root kustomization.yaml"
+  if [[ -f "$sync_dir/kustomization.yaml" ]]; then
+    cp "$sync_dir/kustomization.yaml" "$OUTDIR/kustomization.yaml.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  fi
+
+  {
+    echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+    echo "kind: Kustomization"
+    echo "resources:"
+    echo "  - gotk-components.yaml"
+    echo "  - gotk-sync.yaml"
+
+    if [[ -d "$sync_dir/apps" ]]; then
+      while IFS= read -r app_dir; do
+        [[ -n "$app_dir" ]] || continue
+        echo "  - apps/$(basename "$app_dir")"
+      done < <(find "$sync_dir/apps" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    fi
+  } > "$sync_dir/kustomization.yaml"
+
+  # Do not accidentally commit backup files created by older versions.
+  find "$sync_dir" -maxdepth 1 -type f -name '*.bak.fluxonm.*' -delete 2>/dev/null || true
+
+  section "Git diff preview"
+  git -C "$repo_dir" status --short
+  echo
+  git -C "$repo_dir" diff -- "$GIT_PATH" || true
+
+  echo
+  read -r -p "Commit and push gotk path repair? [Y/n]: " commit_ans || true
+  commit_ans="${commit_ans:-Y}"
+  [[ "$commit_ans" =~ ^[Yy]$ ]] || { warn "Commit skipped"; return 0; }
+
+  git -C "$repo_dir" config user.name "${GITOPS_COMMIT_USER_NAME:-FLUXONM Bot}"
+  git -C "$repo_dir" config user.email "${GITOPS_COMMIT_USER_EMAIL:-fluxonm@example.local}"
+
+  git -C "$repo_dir" add "$GIT_PATH/gotk-components.yaml" "$GIT_PATH/gotk-sync.yaml" "$GIT_PATH/kustomization.yaml"
+
+  if git -C "$repo_dir" diff --cached --quiet; then
+    ok "No changes to commit"
+  else
+    git -C "$repo_dir" commit -m "Repair Flux source-of-truth files under $GIT_PATH"
+    section "Push GitOps repair commit"
+    git_push_with_configured_auth "$repo_dir" "$GIT_BRANCH"
+  fi
+
+  section "Apply and reconcile"
+  kubectl_ctx apply -f "$sync_dir/gotk-components.yaml"
+  kubectl_ctx apply -f "$sync_dir/gotk-sync.yaml"
+
+  flux_ctx reconcile source git flux-system -n "$FLUX_NAMESPACE" || true
+  flux_ctx reconcile kustomization flux-system -n "$FLUX_NAMESPACE" --with-source || true
+
+  ok "GOTK path repair completed"
+
+  echo
+  echo "Next:"
+  echo "  FLUXONM flux-status"
+  echo "  FLUXONM flux-trace"
+  echo "  FLUXONM --mode management public-repo-deploy"
+}
+
+cmd_git_auth_test() {
+  require_management
+  sync_gitops_bootstrap_vars
+
+  [[ -n "${GIT_URL:-}" ]] || die "GIT_URL missing"
+  [[ -n "${GIT_BRANCH:-}" ]] || die "GIT_BRANCH missing"
+
+  section "Git Authentication Test"
+  echo "Repo     : $GIT_URL"
+  echo "Branch   : $GIT_BRANCH"
+  echo "Username : ${GIT_USERNAME:-git}"
+  echo "Auth     : ${GIT_AUTH_MODE:-basic}"
+  echo
+
+  local tmp
+  tmp="$(mktemp -d)/repo-test"
+  if git_clone_with_configured_auth "$GIT_URL" "$GIT_BRANCH" "$tmp"; then
+    ok "Git clone/authentication successful"
+  else
+    die "Git clone/authentication failed"
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.3 persistent output history + output browser
+# ------------------------------------------------------------------------------
+
+history_write_index() {
+  local label="$1"
+  local file="$2"
+  local rc="${3:-0}"
+  mkdir -p "$HISTORY_DIR" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date -Is)" \
+    "$RUN_ID" \
+    "${MODE:-unset}" \
+    "${KUBE_CONTEXT:-unset}" \
+    "$rc" \
+    "$label | $file" >> "$COMMAND_INDEX"
+}
+
+history_append_master() {
+  local label="$1"
+  local file="$2"
+  local rc="${3:-0}"
+
+  {
+    echo
+    echo "################################################################################"
+    echo "# FLUXONM HISTORY ENTRY"
+    echo "# timestamp : $(date -Is)"
+    echo "# run_id    : $RUN_ID"
+    echo "# label     : $label"
+    echo "# rc        : $rc"
+    echo "# mode      : ${MODE:-unset}"
+    echo "# context   : ${KUBE_CONTEXT:-unset}"
+    echo "# namespace : ${ACTIVE_NAMESPACE:-unset}"
+    echo "# file      : $file"
+    echo "################################################################################"
+    [[ -f "$file" ]] && cat "$file"
+    echo
+    echo "################################################################################"
+    echo "# END FLUXONM HISTORY ENTRY: $label"
+    echo "################################################################################"
+  } >> "$MASTER_LOG" 2>/dev/null || true
+}
+
+capture_stream() {
+  local label="$1"
+  shift
+  local safe_label
+  safe_label="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/_$//')"
+  local file="$OUTDIR/${safe_label}.log"
+
+  mkdir -p "$OUTDIR" "$HISTORY_DIR"
+
+  {
+    echo "### FLUXONM capture"
+    echo "### label      : $label"
+    echo "### timestamp  : $(date -Is)"
+    echo "### run_id     : $RUN_ID"
+    echo "### mode       : ${MODE:-unset}"
+    echo "### context    : ${KUBE_CONTEXT:-unset}"
+    echo "### namespace  : ${ACTIVE_NAMESPACE:-unset}"
+    echo "### command    : $*"
+    echo
+    "$@"
+  } 2>&1 | tee "$file"
+
+  local rc=${PIPESTATUS[0]}
+  history_write_index "$label" "$file" "$rc"
+  history_append_master "$label" "$file" "$rc"
+
+  echo
+  if [[ $rc -eq 0 ]]; then
+    ok "Output captured: $file"
+  else
+    warn "Command exited rc=$rc; output captured: $file"
+  fi
+  echo "Persistent history:"
+  echo "  $MASTER_LOG"
+  echo "Latest output link:"
+  echo "  $LATEST_DIR_LINK"
+  return $rc
+}
+
+capture_block() {
+  local label="$1"
+  local safe_label
+  safe_label="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/_$//')"
+  local file="$OUTDIR/${safe_label}.log"
+
+  mkdir -p "$OUTDIR" "$HISTORY_DIR"
+
+  {
+    echo "### FLUXONM capture"
+    echo "### label      : $label"
+    echo "### timestamp  : $(date -Is)"
+    echo "### run_id     : $RUN_ID"
+    echo "### mode       : ${MODE:-unset}"
+    echo "### context    : ${KUBE_CONTEXT:-unset}"
+    echo "### namespace  : ${ACTIVE_NAMESPACE:-unset}"
+    echo
+    cat
+  } | tee "$file"
+
+  local rc=${PIPESTATUS[0]}
+  history_write_index "$label" "$file" "$rc"
+  history_append_master "$label" "$file" "$rc"
+
+  echo
+  ok "Output captured: $file"
+  echo "Persistent history:"
+  echo "  $MASTER_LOG"
+  echo "Latest output link:"
+  echo "  $LATEST_DIR_LINK"
+}
+
+cmd_output_history() {
+  header
+  require_supervision
+
+  section "FLUXONM Persistent Output History"
+  echo "History dir       : $HISTORY_DIR"
+  echo "Master log        : $MASTER_LOG"
+  echo "Command index     : $COMMAND_INDEX"
+  echo "Latest output     : $LATEST_DIR_LINK"
+  echo
+
+  if [[ ! -s "$COMMAND_INDEX" ]]; then
+    warn "No command history found yet."
+    return 0
+  fi
+
+  echo "Recent command captures:"
+  echo
+  tail -50 "$COMMAND_INDEX" | awk -F'\t' '
+    {
+      printf "%3d  %-25s  run=%-18s  mode=%-11s rc=%-3s  %s\n", NR, $1, $2, $3, $5, $6
+    }'
+  echo
+  echo "Open full master log:"
+  echo "  FLUXONM output-master"
+  echo
+  echo "Open latest output directory:"
+  echo "  FLUXONM output-latest"
+}
+
+cmd_output_master() {
+  header
+  require_supervision
+
+  if [[ ! -s "$MASTER_LOG" ]]; then
+    warn "Master history log is empty: $MASTER_LOG"
+    return 0
+  fi
+
+  viewer "$MASTER_LOG"
+}
+
+cmd_output_latest() {
+  header
+  require_supervision
+
+  section "Latest Output Directory"
+  echo "$LATEST_DIR_LINK"
+  echo
+
+  if [[ ! -d "$LATEST_DIR_LINK" ]]; then
+    warn "Latest output directory not found."
+    return 0
+  fi
+
+  find "$LATEST_DIR_LINK" -maxdepth 1 -type f -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" 2>/dev/null | sort || true
+}
+
+cmd_output_runs() {
+  header
+  require_supervision
+
+  section "All Output Runs"
+  find "$OUT_ROOT" -mindepth 1 -maxdepth 1 -type d -printf "%TY-%Tm-%Td %TH:%TM:%TS %p\n" 2>/dev/null | sort -r | head -100 || true
+}
+
+cmd_output_open() {
+  header
+  require_supervision
+
+  if [[ ! -s "$COMMAND_INDEX" ]]; then
+    warn "No command history available."
+    return 0
+  fi
+
+  local entries=()
+  mapfile -t entries < <(tail -50 "$COMMAND_INDEX" | awk -F'\t' '{print $1 " | rc=" $5 " | " $6}')
+
+  local selected rc file
+  set +e
+  selected="$(select_from_list "Select captured output to open" "${entries[@]}")"
+  rc=$?
+  set -e
+
+  [[ $rc -eq 0 ]] || { warn "Output open cancelled."; return 0; }
+
+  file="$(awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' <<<"$selected")"
+
+  if [[ -f "$file" ]]; then
+    viewer "$file"
+  else
+    warn "Output file not found: $file"
+  fi
+}
+
+cmd_output_bundle_all() {
+  header
+  require_supervision
+
+  local bundle="$HISTORY_DIR/fluxonm-all-history-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$bundle" -C "$STATE_DIR" history output logs 2>/dev/null || true
+  ok "All history bundle created: $bundle"
+  ls -lh "$bundle" 2>/dev/null || true
+}
+
+cmd_capture-last() {
+  header
+  require_supervision
+  cmd_output_latest
+}
+
+cmd_output_bundle() {
+  header
+  require_supervision
+  local bundle="$OUTDIR/fluxonm-output-bundle-$RUN_ID.tar.gz"
+  tar -czf "$bundle" -C "$OUTDIR" . 2>/dev/null || true
+  ok "Current run output bundle created: $bundle"
+  ls -lh "$bundle" 2>/dev/null || true
+  echo
+  echo "For all previous outputs:"
+  echo "  FLUXONM output-bundle-all"
+}
+
+
+
+# ------------------------------------------------------------------------------
+# v6.4 app run + port-forward automation
+# ------------------------------------------------------------------------------
+
+cmd_app_run() {
+  header
+  require_supervision
+
+  local app_ns="${PUBLIC_APP_NAMESPACE:-podinfo-demo}"
+  local app_svc="${PUBLIC_APP_SERVICE:-podinfo}"
+
+  {
+    section "Automated Application Runtime Check"
+    echo "App namespace    : $app_ns"
+    echo "Service          : $app_svc"
+    echo
+
+    section "Flux Status"
+    flux_ctx get all -A || true
+
+    section "Public Repo Status"
+    echo "GitRepositories:"
+    kubectl_ctx get gitrepositories -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+    echo
+    echo "Kustomizations:"
+    kubectl_ctx get kustomizations -n "$FLUX_NAMESPACE" -o wide 2>/dev/null || true
+
+    section "Application Resources"
+    kubectl_ctx get all -n "$app_ns" -o wide || true
+
+    section "Application Events"
+    kubectl_ctx get events -n "$app_ns" --sort-by=.lastTimestamp 2>/dev/null | tail -40 || true
+  } | capture_block "app-run-status"
+}
+
+port_forward_pid_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+cmd_app_port_forward_status() {
+  header
+  require_supervision
+
+  section "Port-forward Status"
+
+  if [[ ! -f "$PF_STATE_FILE" ]]; then
+    warn "No port-forward state file found."
+    echo "Start it with:"
+    echo "  FLUXONM --mode management app-forward"
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  . "$PF_STATE_FILE"
+
+  echo "State file       : $PF_STATE_FILE"
+  echo "PID              : ${PF_PID:-unset}"
+  echo "Namespace        : ${PF_NAMESPACE:-unset}"
+  echo "Service          : ${PF_SERVICE:-unset}"
+  echo "Local port       : ${PF_LOCAL_PORT:-unset}"
+  echo "Service port     : ${PF_SERVICE_PORT:-unset}"
+  echo "Log file         : ${PF_LOG_FILE:-unset}"
+  echo "URL              : http://localhost:${PF_LOCAL_PORT:-9898}"
+  echo
+
+  if port_forward_pid_alive "${PF_PID:-}"; then
+    ok "Port-forward is running"
+  else
+    warn "Port-forward is not running"
+  fi
+
+  if [[ -f "${PF_LOG_FILE:-}" ]]; then
+    echo
+    echo "Recent port-forward log:"
+    tail -30 "$PF_LOG_FILE" || true
+  fi
+}
+
+cmd_app_forward() {
+  require_management
+
+  local app_ns="${PUBLIC_APP_NAMESPACE:-podinfo-demo}"
+  local app_svc="${PUBLIC_APP_SERVICE:-podinfo}"
+  local local_port="${PUBLIC_APP_LOCAL_PORT:-9898}"
+  local svc_port="${PUBLIC_APP_SERVICE_PORT:-9898}"
+  local log_file="$PF_DIR/${app_ns}-${app_svc}-${local_port}.log"
+
+  section "Start Application Port-forward"
+  echo "Namespace        : $app_ns"
+  echo "Service          : $app_svc"
+  echo "Forward          : localhost:${local_port} -> service/${app_svc}:${svc_port}"
+  echo "Log              : $log_file"
+  echo
+
+  if [[ -f "$PF_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$PF_STATE_FILE" || true
+    if port_forward_pid_alive "${PF_PID:-}"; then
+      ok "Port-forward already running: PID ${PF_PID}"
+      echo "URL: http://localhost:${PF_LOCAL_PORT:-$local_port}"
+      return 0
+    fi
+  fi
+
+  kubectl_ctx get ns "$app_ns" >/dev/null 2>&1 || die "Namespace not found: $app_ns"
+  kubectl_ctx get svc "$app_svc" -n "$app_ns" >/dev/null 2>&1 || die "Service not found: $app_ns/$app_svc"
+
+  mkdir -p "$PF_DIR"
+  : > "$log_file"
+
+  nohup kubectl --kubeconfig "$KUBECONFIG_PATH" ${KUBE_CONTEXT:+--context "$KUBE_CONTEXT"} \
+    -n "$app_ns" port-forward "svc/$app_svc" "${local_port}:${svc_port}" \
+    > "$log_file" 2>&1 &
+
+  local pid=$!
+  sleep 2
+
+  cat > "$PF_STATE_FILE" <<EOF
+PF_PID="$pid"
+PF_NAMESPACE="$app_ns"
+PF_SERVICE="$app_svc"
+PF_LOCAL_PORT="$local_port"
+PF_SERVICE_PORT="$svc_port"
+PF_LOG_FILE="$log_file"
+PF_STARTED_AT="$(date -Is)"
+EOF
+
+  if port_forward_pid_alive "$pid"; then
+    ok "Port-forward started: PID $pid"
+    echo "URL: http://localhost:${local_port}"
+    echo "Log: $log_file"
+    echo
+    tail -20 "$log_file" || true
+  else
+    warn "Port-forward process exited. Check log: $log_file"
+    cat "$log_file" || true
+    return 1
+  fi
+}
+
+cmd_app_forward_stop() {
+  require_management
+
+  section "Stop Application Port-forward"
+
+  if [[ ! -f "$PF_STATE_FILE" ]]; then
+    warn "No port-forward state file found."
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  . "$PF_STATE_FILE"
+
+  if port_forward_pid_alive "${PF_PID:-}"; then
+    kill "$PF_PID" >/dev/null 2>&1 || true
+    sleep 1
+    if port_forward_pid_alive "$PF_PID"; then
+      kill -9 "$PF_PID" >/dev/null 2>&1 || true
+    fi
+    ok "Stopped port-forward PID: $PF_PID"
+  else
+    warn "Port-forward PID not running: ${PF_PID:-unset}"
+  fi
+
+  rm -f "$PF_STATE_FILE"
+}
+
+cmd_app_forward_restart() {
+  require_management
+  cmd_app_forward_stop || true
+  cmd_app_forward
+}
+
+cmd_app_open_info() {
+  header
+  require_supervision
+
+  local app_ns="${PUBLIC_APP_NAMESPACE:-podinfo-demo}"
+  local app_svc="${PUBLIC_APP_SERVICE:-podinfo}"
+  local local_port="${PUBLIC_APP_LOCAL_PORT:-9898}"
+
+  section "Application Access"
+  echo "Browser URL:"
+  echo "  http://localhost:${local_port}"
+  echo
+  echo "Check resources:"
+  echo "  kubectl --kubeconfig ${KUBECONFIG_PATH} get all -n ${app_ns} -o wide"
+  echo
+  echo "Start port-forward:"
+  echo "  FLUXONM --mode management app-forward"
+  echo
+  echo "Stop port-forward:"
+  echo "  FLUXONM --mode management app-forward-stop"
+  echo
+  echo "Service:"
+  kubectl_ctx get svc "$app_svc" -n "$app_ns" -o wide 2>/dev/null || true
+}
+
+cmd_app_auto() {
+  require_management
+
+  section "Automated App Check + Port-forward"
+  echo "This will run:"
+  echo "  1. Flux status"
+  echo "  2. Public repo status"
+  echo "  3. kubectl get all -n podinfo-demo -o wide"
+  echo "  4. Background port-forward service/podinfo 9898:9898"
+  echo
+
+  cmd_app_run
+  cmd_app_forward
+  cmd_app_open_info
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.5 final override: robust kubectl port-forward command order
+# ------------------------------------------------------------------------------
+
+build_kubectl_base_array() {
+  KUBECTL_BASE=(kubectl)
+  [[ -n "${KUBECONFIG_PATH:-}" ]] && KUBECTL_BASE+=(--kubeconfig "$KUBECONFIG_PATH")
+  [[ -n "${KUBE_CONTEXT:-}" ]] && KUBECTL_BASE+=(--context "$KUBE_CONTEXT")
+}
+
+cmd_app_forward() {
+  require_management
+
+  local app_ns="${PUBLIC_APP_NAMESPACE:-podinfo-demo}"
+  local app_svc="${PUBLIC_APP_SERVICE:-podinfo}"
+  local local_port="${PUBLIC_APP_LOCAL_PORT:-9898}"
+  local svc_port="${PUBLIC_APP_SERVICE_PORT:-9898}"
+  local log_file="$PF_DIR/${app_ns}-${app_svc}-${local_port}.log"
+
+  section "Start Application Port-forward"
+  echo "Namespace        : $app_ns"
+  echo "Service          : $app_svc"
+  echo "Forward          : localhost:${local_port} -> service/${app_svc}:${svc_port}"
+  echo "Log              : $log_file"
+  echo
+
+  if [[ -f "$PF_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$PF_STATE_FILE" || true
+    if port_forward_pid_alive "${PF_PID:-}"; then
+      ok "Port-forward already running: PID ${PF_PID}"
+      echo "URL: http://localhost:${PF_LOCAL_PORT:-$local_port}"
+      return 0
+    fi
+  fi
+
+  kubectl_ctx get ns "$app_ns" >/dev/null 2>&1 || die "Namespace not found: $app_ns"
+  kubectl_ctx get svc "$app_svc" -n "$app_ns" >/dev/null 2>&1 || die "Service not found: $app_ns/$app_svc"
+
+  mkdir -p "$PF_DIR"
+  : > "$log_file"
+
+  build_kubectl_base_array
+  local cmd=("${KUBECTL_BASE[@]}" port-forward -n "$app_ns" "svc/$app_svc" "${local_port}:${svc_port}")
+
+  echo "Command preview:"
+  printf '  %q ' "${cmd[@]}"
+  echo
+
+  nohup "${cmd[@]}" > "$log_file" 2>&1 &
+
+  local pid=$!
+  sleep 2
+
+  cat > "$PF_STATE_FILE" <<EOF
+PF_PID="$pid"
+PF_NAMESPACE="$app_ns"
+PF_SERVICE="$app_svc"
+PF_LOCAL_PORT="$local_port"
+PF_SERVICE_PORT="$svc_port"
+PF_LOG_FILE="$log_file"
+PF_STARTED_AT="$(date -Is)"
+PF_COMMAND="$(printf '%q ' "${cmd[@]}")"
+EOF
+
+  if port_forward_pid_alive "$pid"; then
+    ok "Port-forward started: PID $pid"
+    echo "URL: http://localhost:${local_port}"
+    echo "Log: $log_file"
+    echo
+    tail -20 "$log_file" || true
+  else
+    warn "Port-forward process exited. Check log: $log_file"
+    cat "$log_file" || true
+    rm -f "$PF_STATE_FILE"
+    return 1
+  fi
+}
+
+cmd_app_port_forward_status() {
+  header
+  require_supervision
+
+  section "Port-forward Status"
+
+  if [[ ! -f "$PF_STATE_FILE" ]]; then
+    warn "No port-forward state file found."
+    echo "Start it with:"
+    echo "  FLUXONM --mode management app-forward"
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  . "$PF_STATE_FILE"
+
+  echo "State file       : $PF_STATE_FILE"
+  echo "PID              : ${PF_PID:-unset}"
+  echo "Namespace        : ${PF_NAMESPACE:-unset}"
+  echo "Service          : ${PF_SERVICE:-unset}"
+  echo "Local port       : ${PF_LOCAL_PORT:-unset}"
+  echo "Service port     : ${PF_SERVICE_PORT:-unset}"
+  echo "Log file         : ${PF_LOG_FILE:-unset}"
+  echo "URL              : http://localhost:${PF_LOCAL_PORT:-9898}"
+  echo "Command          : ${PF_COMMAND:-unset}"
+  echo
+
+  if port_forward_pid_alive "${PF_PID:-}"; then
+    ok "Port-forward is running"
+  else
+    warn "Port-forward is not running"
+  fi
+
+  if [[ -f "${PF_LOG_FILE:-}" ]]; then
+    echo
+    echo "Recent port-forward log:"
+    tail -30 "$PF_LOG_FILE" || true
+  fi
+}
+
+cmd_app_forward_cleanup_stale() {
+  require_management
+
+  section "Cleanup stale port-forward state"
+
+  if [[ -f "$PF_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$PF_STATE_FILE" || true
+    if port_forward_pid_alive "${PF_PID:-}"; then
+      warn "Port-forward still running: PID $PF_PID"
+      echo "Use: FLUXONM --mode management app-forward-stop"
+      return 0
+    fi
+    rm -f "$PF_STATE_FILE"
+    ok "Removed stale state file"
+  else
+    ok "No stale state file found"
+  fi
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.6 final override: port conflict detection + auto free-port selection
+# ------------------------------------------------------------------------------
+
+port_in_use() {
+  local port="$1"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"
+    return $?
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}$"
+    return $?
+  fi
+
+  return 1
+}
+
+show_port_listener() {
+  local port="$1"
+
+  echo
+  echo "Listener details for port $port:"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E "(:|\\])${port}[[:space:]]" || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp 2>/dev/null | grep -E "(:|\\])${port}[[:space:]]" || true
+  else
+    echo "No ss/lsof/netstat command available to show listener process."
+  fi
+}
+
+find_free_port() {
+  local start_port="${1:-9898}"
+  local max_port="${2:-9999}"
+  local p
+
+  for ((p=start_port; p<=max_port; p++)); do
+    if ! port_in_use "$p"; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+cmd_app_forward() {
+  require_management
+
+  local app_ns="${PUBLIC_APP_NAMESPACE:-podinfo-demo}"
+  local app_svc="${PUBLIC_APP_SERVICE:-podinfo}"
+  local requested_port="${PUBLIC_APP_LOCAL_PORT:-9898}"
+  local local_port="$requested_port"
+  local svc_port="${PUBLIC_APP_SERVICE_PORT:-9898}"
+  local log_file=""
+
+  section "Start Application Port-forward"
+  echo "Namespace        : $app_ns"
+  echo "Service          : $app_svc"
+  echo "Requested port   : localhost:${requested_port} -> service/${app_svc}:${svc_port}"
+  echo
+
+  if [[ -f "$PF_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$PF_STATE_FILE" || true
+    if port_forward_pid_alive "${PF_PID:-}"; then
+      ok "FLUXONM port-forward already running"
+      echo "PID: ${PF_PID}"
+      echo "URL: http://localhost:${PF_LOCAL_PORT:-$requested_port}"
+      echo "Log: ${PF_LOG_FILE:-unset}"
+      return 0
+    fi
+    warn "Removing stale FLUXONM port-forward state"
+    rm -f "$PF_STATE_FILE"
+  fi
+
+  kubectl_ctx get ns "$app_ns" >/dev/null 2>&1 || die "Namespace not found: $app_ns"
+  kubectl_ctx get svc "$app_svc" -n "$app_ns" >/dev/null 2>&1 || die "Service not found: $app_ns/$app_svc"
+
+  if port_in_use "$requested_port"; then
+    warn "Requested local port is already in use: $requested_port"
+    show_port_listener "$requested_port"
+
+    local_port="$(find_free_port "$((requested_port + 1))" 9999)" || die "No free local port found between $((requested_port + 1)) and 9999"
+
+    echo
+    ok "Auto-selected next free local port: $local_port"
+    echo "Forward will be:"
+    echo "  http://localhost:${local_port} -> service/${app_svc}:${svc_port}"
+  fi
+
+  log_file="$PF_DIR/${app_ns}-${app_svc}-${local_port}.log"
+
+  echo
+  echo "Forward          : localhost:${local_port} -> service/${app_svc}:${svc_port}"
+  echo "Log              : $log_file"
+  echo
+
+  mkdir -p "$PF_DIR"
+  : > "$log_file"
+
+  build_kubectl_base_array
+  local cmd=("${KUBECTL_BASE[@]}" port-forward -n "$app_ns" "svc/$app_svc" "${local_port}:${svc_port}")
+
+  echo "Command preview:"
+  printf '  %q ' "${cmd[@]}"
+  echo
+
+  nohup "${cmd[@]}" > "$log_file" 2>&1 &
+
+  local pid=$!
+  sleep 2
+
+  cat > "$PF_STATE_FILE" <<EOF
+PF_PID="$pid"
+PF_NAMESPACE="$app_ns"
+PF_SERVICE="$app_svc"
+PF_LOCAL_PORT="$local_port"
+PF_SERVICE_PORT="$svc_port"
+PF_LOG_FILE="$log_file"
+PF_STARTED_AT="$(date -Is)"
+PF_COMMAND="$(printf '%q ' "${cmd[@]}")"
+EOF
+
+  if port_forward_pid_alive "$pid"; then
+    ok "Port-forward started: PID $pid"
+    echo "URL: http://localhost:${local_port}"
+    echo "Log: $log_file"
+    echo
+    tail -20 "$log_file" || true
+  else
+    warn "Port-forward process exited. Check log: $log_file"
+    cat "$log_file" || true
+    rm -f "$PF_STATE_FILE"
+    return 1
+  fi
+}
+
+cmd_app_forward_stop() {
+  require_management
+
+  section "Stop Application Port-forward"
+
+  if [[ ! -f "$PF_STATE_FILE" ]]; then
+    warn "No FLUXONM port-forward state file found."
+    echo
+    echo "If port 9898 is still busy, inspect manually:"
+    echo "  ss -ltnp | grep ':9898'"
+    return 0
+  fi
+
+  # shellcheck disable=SC1090
+  . "$PF_STATE_FILE"
+
+  if port_forward_pid_alive "${PF_PID:-}"; then
+    kill "$PF_PID" >/dev/null 2>&1 || true
+    sleep 1
+    if port_forward_pid_alive "$PF_PID"; then
+      kill -9 "$PF_PID" >/dev/null 2>&1 || true
+    fi
+    ok "Stopped FLUXONM port-forward PID: $PF_PID"
+  else
+    warn "Port-forward PID not running: ${PF_PID:-unset}"
+  fi
+
+  rm -f "$PF_STATE_FILE"
+}
+
+cmd_app_port_check() {
+  header
+  require_supervision
+
+  local port="${1:-${PUBLIC_APP_LOCAL_PORT:-9898}}"
+
+  section "Port Check"
+  echo "Port: $port"
+
+  if port_in_use "$port"; then
+    warn "Port is in use: $port"
+    show_port_listener "$port"
+    echo
+    local next
+    next="$(find_free_port "$((port + 1))" 9999)" || true
+    [[ -n "$next" ]] && echo "Next free port: $next"
+  else
+    ok "Port is free: $port"
+  fi
+}
+
+cmd_app_forward_force_9898() {
+  require_management
+
+  section "Force cleanup for port 9898"
+
+  if [[ -f "$PF_STATE_FILE" ]]; then
+    cmd_app_forward_stop || true
+  fi
+
+  if port_in_use 9898; then
+    warn "Port 9898 is still in use by an external process."
+    show_port_listener 9898
+    echo
+    echo "FLUXONM will not kill unknown external processes automatically."
+    echo "Use the listener details above to stop the correct process, or let FLUXONM auto-select another port:"
+    echo "  FLUXONM --mode management app-forward"
+    return 1
+  fi
+
+  PUBLIC_APP_LOCAL_PORT=9898 cmd_app_forward
+}
+
+
+# ------------------------------------------------------------------------------
+# v6.7 vCluster persistence / restore lifecycle
+# ------------------------------------------------------------------------------
+
+vcluster_container_name() {
+  printf '%s.%s' "${VCLUSTER_CONTAINER_PREFIX:-vcluster.cp}" "${VCLUSTER_NAME:-dev}"
+}
+
+cmd_vcluster_persistence_status() {
+  header
+  require_supervision
+
+  local cname
+  cname="$(vcluster_container_name)"
+
+  {
+    section "vCluster Persistence Status"
+    echo "vCluster name       : ${VCLUSTER_NAME:-dev}"
+    echo "Expected container  : $cname"
+    echo "State directory     : ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+    echo "Kubeconfig          : ${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}"
+    echo
+
+    section "Docker Container"
+    if docker ps -a --format '{{.Names}}' | grep -qx "$cname"; then
+      docker ps -a --filter "name=^/${cname}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+      echo
+      docker inspect "$cname" --format 'RestartPolicy={{.HostConfig.RestartPolicy.Name}} State={{.State.Status}} StartedAt={{.State.StartedAt}}' 2>/dev/null || true
+    else
+      warn "vCluster container not found: $cname"
+    fi
+
+    section "Docker Volumes"
+    docker volume ls --format '{{.Name}}' | grep -E "^${cname//./\\.}" || warn "No matching vCluster Docker volumes found for $cname"
+
+    section "Local State Directory"
+    if [[ -d "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}" ]]; then
+      du -sh "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}" 2>/dev/null || true
+      find "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}" -maxdepth 3 -type d 2>/dev/null | head -50 || true
+    else
+      warn "State directory not found: ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+    fi
+
+    section "Kubernetes Reachability"
+    if [[ -s "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" ]]; then
+      kubectl --kubeconfig "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" get nodes -o wide || true
+      kubectl --kubeconfig "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" get ns || true
+    else
+      warn "vCluster kubeconfig not found"
+    fi
+
+    section "Flux/App Status"
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" get pods -n "${FLUX_NAMESPACE:-flux-system}" -o wide 2>/dev/null || true
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" get gitrepositories,kustomizations -n "${FLUX_NAMESPACE:-flux-system}" -o wide 2>/dev/null || true
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}" get all -n "${PUBLIC_APP_NAMESPACE:-podinfo-demo}" -o wide 2>/dev/null || true
+  } | capture_block "vcluster-persistence-status"
+}
+
+cmd_vcluster_set_restart_policy() {
+  require_management
+
+  local cname
+  cname="$(vcluster_container_name)"
+
+  section "Set Docker restart policy for vCluster"
+  echo "Container      : $cname"
+  echo "Restart policy : unless-stopped"
+  echo
+
+  if ! docker ps -a --format '{{.Names}}' | grep -qx "$cname"; then
+    die "Container not found: $cname"
+  fi
+
+  docker update --restart unless-stopped "$cname"
+  ok "Restart policy set: $cname -> unless-stopped"
+
+  docker inspect "$cname" --format '{{.Name}} restart={{.HostConfig.RestartPolicy.Name}}'
+}
+
+cmd_vcluster_set_restart_policy_all() {
+  require_management
+
+  section "Set Docker restart policy for all vCluster containers"
+
+  local containers=()
+  mapfile -t containers < <(docker ps -a --filter "name=vcluster" --format '{{.Names}}' 2>/dev/null || true)
+
+  if [[ ${#containers[@]} -eq 0 ]]; then
+    warn "No vCluster containers found"
+    return 0
+  fi
+
+  local c
+  for c in "${containers[@]}"; do
+    [[ -n "$c" ]] || continue
+    echo "Setting restart policy: $c"
+    docker update --restart unless-stopped "$c" >/dev/null
+    docker inspect "$c" --format '{{.Name}} restart={{.HostConfig.RestartPolicy.Name}}'
+  done
+}
+
+cmd_vcluster_restore() {
+  require_management
+
+  local cname kubeout wait_seconds
+  cname="$(vcluster_container_name)"
+  kubeout="${VCLUSTER_KUBECONFIG:-$HOME/.kube/${VCLUSTER_NAME:-dev}.kubeconfig}"
+  wait_seconds="${VCLUSTER_RESTORE_WAIT_SECONDS:-60}"
+
+  {
+    section "Restore vCluster after Ubuntu/Windows restart"
+    echo "vCluster name       : ${VCLUSTER_NAME:-dev}"
+    echo "Container           : $cname"
+    echo "Kubeconfig output   : $kubeout"
+    echo "Wait seconds        : $wait_seconds"
+    echo "State directory     : ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+    echo
+
+    section "Docker readiness"
+    docker version
+
+    section "Start container if present"
+    if docker ps -a --format '{{.Names}}' | grep -qx "$cname"; then
+      docker start "$cname" >/dev/null || true
+      docker update --restart unless-stopped "$cname" >/dev/null || true
+      docker ps -a --filter "name=^/${cname}$" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+    else
+      warn "Container not found: $cname"
+      echo "If state is missing, create it with:"
+      echo "  FLUXONM --mode management vcluster-create"
+      return 1
+    fi
+
+    section "Regenerate kubeconfig"
+    mkdir -p "$HOME/.kube"
+
+    if command -v vcluster >/dev/null 2>&1; then
+      vcluster connect "${VCLUSTER_NAME:-dev}" --print > "$kubeout" 2>/tmp/fluxonm-vcluster-connect.err || {
+        warn "vcluster connect failed; showing error:"
+        cat /tmp/fluxonm-vcluster-connect.err || true
+      }
+    else
+      warn "vcluster CLI not found"
+    fi
+
+    section "Wait for Kubernetes API"
+    local end now ok_api=0
+    end=$((SECONDS + wait_seconds))
+    while (( SECONDS < end )); do
+      if kubectl --kubeconfig "$kubeout" get nodes >/dev/null 2>&1; then
+        ok_api=1
+        break
+      fi
+      sleep 3
+    done
+
+    if [[ "$ok_api" == "1" ]]; then
+      ok "vCluster API reachable"
+      kubectl --kubeconfig "$kubeout" get nodes -o wide
+    else
+      warn "vCluster API not reachable within ${wait_seconds}s"
+      kubectl --kubeconfig "$kubeout" get nodes -o wide || true
+    fi
+
+    section "Validate Flux"
+    kubectl --kubeconfig "$kubeout" get pods -n "${FLUX_NAMESPACE:-flux-system}" -o wide 2>/dev/null || true
+    kubectl --kubeconfig "$kubeout" get gitrepositories,kustomizations -n "${FLUX_NAMESPACE:-flux-system}" -o wide 2>/dev/null || true
+
+    section "Validate app"
+    kubectl --kubeconfig "$kubeout" get all -n "${PUBLIC_APP_NAMESPACE:-podinfo-demo}" -o wide 2>/dev/null || true
+
+    section "Update FLUXONM preferences"
+    KUBECONFIG_PATH="$kubeout"
+    KUBE_CONTEXT="$(kubectl --kubeconfig "$kubeout" config current-context 2>/dev/null || echo "${KUBE_CONTEXT:-}")"
+    LOCKED_CONTEXT="$KUBE_CONTEXT"
+    VCLUSTER_KUBECONFIG="$kubeout"
+    save_prefs
+
+    ok "vCluster restore completed"
+    echo
+    echo "Next commands:"
+    echo "  FLUXONM flux-status"
+    echo "  FLUXONM public-repo-status"
+    echo "  FLUXONM --mode management app-forward"
+  } | tee "$VCLUSTER_RESTORE_LOG"
+
+  local rc=${PIPESTATUS[0]}
+  history_write_index "vcluster-restore" "$VCLUSTER_RESTORE_LOG" "$rc" 2>/dev/null || true
+  history_append_master "vcluster-restore" "$VCLUSTER_RESTORE_LOG" "$rc" 2>/dev/null || true
+  return "$rc"
+}
+
+cmd_vcluster_restore_install_shortcut() {
+  require_management
+
+  section "Install RESTORE_VCLUSTER shortcut"
+
+  local target="/usr/local/bin/RESTORE_VCLUSTER"
+  local source_path
+  source_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+  sudo tee "$target" >/dev/null <<EOF
+#!/usr/bin/env bash
+exec "$source_path" --mode management vcluster-restore "\$@"
+EOF
+
+  sudo chmod 0755 "$target"
+
+  ok "Installed shortcut: $target"
+  echo
+  echo "After Windows/Ubuntu restart, run:"
+  echo "  RESTORE_VCLUSTER"
+}
+
+cmd_vcluster_restore_setup() {
+  require_management
+
+  section "Production vCluster persistence setup"
+
+  cmd_vcluster_set_restart_policy_all
+  cmd_vcluster_restore_install_shortcut
+
+  echo
+  ok "Persistence setup completed"
+  echo
+  echo "Do not delete:"
+  echo "  ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+  echo "  Docker volumes matching: $(vcluster_container_name).*"
+  echo
+  echo "After restart:"
+  echo "  RESTORE_VCLUSTER"
+  echo "  FLUXONM public-repo-status"
+}
+
+cmd_vcluster_backup_state() {
+  require_management
+
+  local backup_dir="$STATE_DIR/backups"
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  local backup_file="$backup_dir/vcluster-state-${VCLUSTER_NAME:-dev}-${ts}.tar.gz"
+
+  mkdir -p "$backup_dir"
+
+  section "Backup vCluster local state"
+  echo "State directory : ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+  echo "Backup file     : $backup_file"
+
+  if [[ ! -d "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}" ]]; then
+    die "State directory not found: ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}"
+  fi
+
+  tar -czf "$backup_file" -C "$(dirname "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}")" "$(basename "${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}")"
+
+  ok "vCluster state backup created: $backup_file"
+  ls -lh "$backup_file" || true
+}
+
+cmd_vcluster_safety_rules() {
+  header
+  require_supervision
+
+  section "vCluster State Safety Rules"
+  cat <<RULES
+Do not delete these unless you intentionally want to reset the vCluster:
+
+  ${VCLUSTER_STATE_DIR:-$HOME/.vcluster/docker}
+  Docker container: $(vcluster_container_name)
+  Docker volumes matching: $(vcluster_container_name).*
+
+Avoid these destructive commands:
+
+  rm -rf ~/.vcluster/docker/kubernetes/*
+  rm -rf ~/.vcluster/docker/vcluster/*
+  rm -rf ~/.vcluster/docker/vclusters/${VCLUSTER_NAME:-dev}
+  docker rm -f $(vcluster_container_name)
+  docker volume rm \$(docker volume ls -q | grep '$(vcluster_container_name)')
+
+Recommended persistence commands:
+
+  FLUXONM --mode management vcluster-persistence-setup
+  RESTORE_VCLUSTER
+
+RULES
+}
+
+# ------------------------------------------------------------------------------
+# Args / Routing
+# ------------------------------------------------------------------------------
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)
+        case "${2:-}" in
+          supervision|SUPERVISION) MODE="SUPERVISION"; shift 2 ;;
+          management|MANAGEMENT) MODE="MANAGEMENT"; shift 2 ;;
+          *) die "--mode must be supervision or management" ;;
+        esac
+        ;;
+      -y|--yes) ASSUME_YES=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      --json) JSON_OUT=1; shift ;;
+      --no-color) NO_COLOR=1; shift ;;
+      -h|--help) COMMAND="help"; shift; return ;;
+      *) break ;;
+    esac
+  done
+  COMMAND="${1:-help}"
+  shift || true
+  COMMAND_ARGS=("$@")
+}
+
+main() {
+  parse_args "$@"
+  load_prefs
+
+  case "$COMMAND" in
+    help|-h|--help) usage ;;
+    start) cmd_start ;;
+    dashboard) cmd_dashboard ;;
+    setup) cmd_setup ;;
+    detect) cmd_detect ;;
+    context-select) cmd_context_select ;;
+    namespace-select) cmd_namespace_select ;;
+    lock-init) cmd_lock_init ;;
+    lock-show) cmd_lock_show ;;
+    target-select) cmd_target_select ;;
+    self-test) cmd_self_test ;;
+    install-shortcut) cmd_install_shortcut ;;
+    doctor|health) cmd_doctor ;;
+    status) cmd_status ;;
+    prefs) cmd_prefs ;;
+    set) cmd_set "${COMMAND_ARGS[@]:-}" ;;
+    edit-prefs) cmd_edit_prefs ;;
+
+    k8s-status) cmd_k8s_status ;;
+    k8s-pods) cmd_k8s_pods ;;
+    k8s-events) cmd_k8s_events ;;
+    k8s-logs) cmd_k8s_logs ;;
+    k8s-describe) cmd_k8s_describe ;;
+    k8s-yaml) cmd_k8s_yaml ;;
+    k8s-top) cmd_k8s_top ;;
+    quick-filter) cmd_quick_filter ;;
+
+    k8s-rollout-restart) cmd_k8s_rollout_restart ;;
+    k8s-scale) cmd_k8s_scale ;;
+    pod-delete) cmd_pod_delete ;;
+    pod-force-delete) cmd_pod_force_delete ;;
+
+    vcluster-status) cmd_vcluster_status ;;
+    vcluster-safety-rules) cmd_vcluster_safety_rules ;;
+    vcluster-backup-state) cmd_vcluster_backup_state ;;
+    vcluster-persistence-setup) cmd_vcluster_restore_setup ;;
+    vcluster-restore-install-shortcut) cmd_vcluster_restore_install_shortcut ;;
+    vcluster-restore) cmd_vcluster_restore ;;
+    vcluster-set-restart-policy-all) cmd_vcluster_set_restart_policy_all ;;
+    vcluster-set-restart-policy) cmd_vcluster_set_restart_policy ;;
+    vcluster-persistence-status) cmd_vcluster_persistence_status ;;
+    vcluster-create) cmd_vcluster_create ;;
+    vcluster-delete) cmd_vcluster_delete ;;
+    vcluster-pause) cmd_vcluster_pause ;;
+    vcluster-resume) cmd_vcluster_resume ;;
+
+    public-repo-deploy) cmd_public_repo_deploy_wizard ;;
+    public-repo-status) cmd_public_repo_status ;;
+    app-run) cmd_app_run ;;
+    app-forward) cmd_app_forward ;;
+    app-forward-status) cmd_app_port_forward_status ;;
+    app-forward-stop) cmd_app_forward_stop ;;
+    app-forward-restart) cmd_app_forward_restart ;;
+    app-forward-cleanup) cmd_app_forward_cleanup_stale ;;
+    app-forward-force-9898) cmd_app_forward_force_9898 ;;
+    app-port-check) cmd_app_port_check ;;
+    app-open-info) cmd_app_open_info ;;
+    app-auto) cmd_app_auto ;;
+    gitops-config) cmd_gitops_config ;;
+    gitops-status) cmd_gitops_status ;;
+    gitops-validate) cmd_gitops_validate ;;
+    gitops-print-command) cmd_gitops_print_command ;;
+    gitops-provider-select) cmd_gitops_provider_select ;;
+    git-token-prompt) cmd_git_token_prompt ;;
+    git-auth-test) cmd_git_auth_test ;;
+    gitops-quick-setup) cmd_gitops_quick_setup ;;
+    gitops-deploy) cmd_gitops_deploy ;;
+    flux-install) cmd_flux_install ;;
+    flux-status) cmd_flux_status ;;
+    flux-health) cmd_flux_health ;;
+    flux-logs) cmd_flux_logs ;;
+    flux-trace) cmd_flux_trace ;;
+    flux-bootstrap-github) cmd_flux_bootstrap_github ;;
+    flux-sync-generic) cmd_flux_sync_generic ;;
+    flux-reconcile) cmd_flux_reconcile ;;
+    flux-repair-https) cmd_flux_repair_https_token_auth ;;
+    flux-repair-gotk-path) cmd_flux_repair_gotk_path ;;
+    flux-suspend) cmd_flux_suspend ;;
+    flux-resume) cmd_flux_resume ;;
+    flux-delete-sync) cmd_flux_delete_sync ;;
+
+    diagnostics) cmd_diagnostics ;;
+    audit) cmd_audit ;;
+    capture-last) cmd_capture-last ;;
+    output-bundle) cmd_output_bundle ;;
+    output-bundle-all) cmd_output_bundle_all ;;
+    output-open) cmd_output_open ;;
+    output-runs) cmd_output_runs ;;
+    output-latest) cmd_output_latest ;;
+    output-master) cmd_output_master ;;
+    output-history) cmd_output_history ;;
+    palette) cmd_palette ;;
+
+    *) die "Unknown command: $COMMAND. Run: $SCRIPT_NAME help" ;;
+  esac
+}
+
+main "$@"

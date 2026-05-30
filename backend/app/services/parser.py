@@ -15,6 +15,7 @@ class ParsedAlgorithm:
     name: str
     description: str | None
     functions: list[dict]
+    imports: list[str]
     doctests: list[str]
     complexity: dict
     source_code: str
@@ -49,6 +50,7 @@ def parse_python_file(path: Path) -> ParsedAlgorithm:
         name=title_from_path(path),
         description=_first_paragraph(module_doc) or _first_function_summary(functions),
         functions=functions,
+        imports=_imports(tree),
         doctests=DOCTEST_RE.findall(all_docs),
         complexity={
             "time": _match_complexity(TIME_RE, source + "\n" + all_docs),
@@ -67,6 +69,16 @@ def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
         args.append(f"**{node.args.kwarg.arg}")
     prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
     return f"{prefix}{node.name}({', '.join(args)})"
+
+
+def _imports(tree: ast.AST) -> list[str]:
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".")[0])
+    return sorted(imports)
 
 
 def _first_paragraph(doc: str | None) -> str | None:

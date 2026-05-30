@@ -8,7 +8,11 @@
     "frontend:dev": "npm --workspace frontend run dev",
     "backend:dev": "cd backend && uvicorn app.main:app --reload",
     "lint": "npm --workspace frontend run lint",
-    "test": "npm --workspace frontend run test"
+    "test": "npm --workspace frontend run test",
+    "frontend:build": "npm --workspace frontend run build",
+    "backend:test": "cd backend && python -m pytest",
+    "migrate": "cd backend && alembic upgrade head",
+    "sync": "curl -X POST http://localhost:8000/api/admin/sync -H \"X-Admin-Token: local-admin-token\"",
+    "ci": "npm run lint && npm run test && npm run frontend:build"
   }
 }
-

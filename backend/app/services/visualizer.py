@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+import tempfile
 import time
 
 from app.core.config import get_settings
@@ -30,6 +31,24 @@ MAX_NUMERIC_ITEMS = 24
 
 class TraceLimitReached(Exception):
     pass
+
+
+class CappedStringIO(io.StringIO):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+        self.truncated = False
+
+    def write(self, text):
+        remaining = self.limit - len(self.getvalue())
+        if remaining <= 0:
+            self.truncated = True
+            return len(text)
+        if len(text) > remaining:
+            self.truncated = True
+            super().write(text[:remaining])
+            return len(text)
+        return super().write(text)
 
 
 def safe_repr(value):
@@ -212,10 +231,11 @@ def main():
     stdin_text = payload.get("stdin", "")
     args = payload.get("args", [])
     max_steps = int(payload.get("max_steps", 120))
+    max_output = int(payload.get("max_output", 200000))
     source_lines = code.splitlines()
     steps = []
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
+    stdout_capture = CappedStringIO(max_output)
+    stderr_capture = CappedStringIO(max_output)
     logs = [
         "Visualizer request accepted by Algorithm Learn API.",
         "Runner selected: local Python trace runtime.",
@@ -275,6 +295,8 @@ def main():
         logs.append(f"stdout captured: {{len(stdout_text)}} characters.")
     if stderr_text:
         logs.append(f"stderr captured: {{len(stderr_text)}} characters.")
+    if stdout_capture.truncated or stderr_capture.truncated:
+        logs.append(f"Output was truncated to {{max_output}} characters per stream.")
     logs.append(f"Trace frames captured: {{len(steps)}}.")
     response = {{
         "status": status,
@@ -311,6 +333,8 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=tempfile.gettempdir(),
+        env={"PYTHONIOENCODING": "utf-8"},
     )
     request = json.dumps(
         {
@@ -318,6 +342,7 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
             "stdin": payload.stdin,
             "args": payload.args,
             "max_steps": payload.max_steps,
+            "max_output": settings.execution_output_limit_bytes,
         }
     )
     try:
@@ -343,7 +368,7 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
 
     elapsed = int((time.perf_counter() - started) * 1000)
     stdout_text = stdout.decode(errors="replace")
-    stderr_text = stderr.decode(errors="replace")
+    stderr_text, stderr_truncated = _truncate(stderr.decode(errors="replace"), settings.execution_output_limit_bytes)
     parsed = _extract_visualizer_json(stdout_text)
     if parsed is None:
         logs.append("Visualizer did not return a valid trace payload.")
@@ -367,6 +392,12 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
         parsed["stderr"] = parsed.get("stderr", "") + stderr_text
         parsed["output"] = parsed.get("stdout", "") + parsed["stderr"]
         parsed["logs"].append("Trace process emitted diagnostic stderr.")
+    if stderr_truncated:
+        parsed["logs"].append(f"Trace stderr was truncated to {settings.execution_output_limit_bytes} bytes.")
+    if len(json.dumps(parsed).encode("utf-8")) > settings.visualization_response_limit_bytes:
+        parsed["status"] = "truncated"
+        parsed["steps"] = parsed.get("steps", [])[: max(1, len(parsed.get("steps", [])) // 2)]
+        parsed["logs"].append("Trace response was reduced to stay within the configured response limit.")
     return VisualizeResponse.model_validate(parsed)
 
 
@@ -381,3 +412,10 @@ def _extract_visualizer_json(stdout_text: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _truncate(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="replace") + "\n[truncated]\n", True

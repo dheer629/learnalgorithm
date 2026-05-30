@@ -98,7 +98,7 @@ def build_runnable_code(source_code: str, command: str) -> str:
     prepared_source = _remove_top_level_demo_code(source_code)
     runnable_command = command if _is_statement(command) else f"print(repr({command}))"
     indented = "\n".join(f"    {line}" if line.strip() else line for line in runnable_command.splitlines())
-    return f"{prepared_source.rstrip()}\n\nif __name__ == \"__main__\":\n{indented}\n"
+    return f'{prepared_source.rstrip()}\n\nif __name__ == "__main__":\n{indented}\n'
 
 
 def _is_statement(command: str) -> bool:

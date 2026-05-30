@@ -39,6 +39,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("source_code", sa.Text(), nullable=False),
         sa.Column("functions", postgresql.JSONB(), nullable=False),
+        sa.Column("imports", postgresql.ARRAY(sa.String()), nullable=False),
         sa.Column("doctests", postgresql.ARRAY(sa.Text()), nullable=False),
         sa.Column("complexity", postgresql.JSONB(), nullable=False),
         sa.Column("tags", postgresql.ARRAY(sa.String()), nullable=False),
@@ -48,6 +49,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_algorithms_slug", "algorithms", ["slug"])
     op.create_index("ix_algorithms_name", "algorithms", ["name"])
+    op.create_index("ix_algorithms_category_id", "algorithms", ["category_id"])
+    op.create_index("ix_algorithms_difficulty", "algorithms", ["difficulty"])
+    op.create_index("ix_algorithms_tags", "algorithms", ["tags"], postgresql_using="gin")
     op.create_index("ix_algorithms_search_vector", "algorithms", ["search_vector"], postgresql_using="gin")
     op.create_table(
         "user_progress",

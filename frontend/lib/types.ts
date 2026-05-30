@@ -21,10 +21,23 @@ export type AlgorithmDetail = AlgorithmSummary & {
   source_url: string;
   source_code: string;
   functions: Array<{ name: string; signature: string; docstring?: string; lineno: number }>;
+  imports: string[];
   doctests: string[];
   examples: AlgorithmExample[];
   complexity: { time?: string | null; space?: string | null };
   related: AlgorithmSummary[];
+};
+
+export type AlgorithmSearchResult = {
+  items: AlgorithmSummary[];
+  meta: {
+    total: number;
+    page: number;
+    page_size: number;
+    offset: number;
+    limit: number;
+    sort: string;
+  };
 };
 
 export type AlgorithmExample = {
