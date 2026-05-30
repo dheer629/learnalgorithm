@@ -9,6 +9,129 @@
   --border: 214 18% 84%;
   --primary: 168 72% 30%;
   --accent: 38 88% 55%;
+  --panel: 0 0% 100%;
+  --bubble-a: 199 95% 70%;
+  --bubble-b: 168 72% 62%;
+}
+
+[data-theme="skyline"] {
+  --background: 204 100% 98%;
+  --foreground: 220 32% 13%;
+  --muted: 204 55% 93%;
+  --border: 209 36% 82%;
+  --primary: 201 93% 38%;
+  --accent: 168 76% 42%;
+  --panel: 0 0% 100%;
+  --bubble-a: 199 95% 74%;
+  --bubble-b: 168 80% 68%;
+}
+
+[data-theme="leetcode"] {
+  --background: 215 24% 8%;
+  --foreground: 210 20% 96%;
+  --muted: 216 18% 15%;
+  --border: 216 14% 26%;
+  --primary: 38 92% 54%;
+  --accent: 199 88% 62%;
+  --panel: 218 20% 11%;
+  --bubble-a: 38 95% 56%;
+  --bubble-b: 199 85% 58%;
+}
+
+[data-theme="ocean"] {
+  --background: 198 74% 96%;
+  --foreground: 210 42% 14%;
+  --muted: 195 46% 90%;
+  --border: 199 34% 78%;
+  --primary: 197 87% 35%;
+  --accent: 183 73% 39%;
+  --panel: 0 0% 100%;
+  --bubble-a: 198 95% 72%;
+  --bubble-b: 183 82% 67%;
+}
+
+[data-theme="mint"] {
+  --background: 150 54% 97%;
+  --foreground: 167 35% 13%;
+  --muted: 150 36% 91%;
+  --border: 155 28% 78%;
+  --primary: 158 72% 31%;
+  --accent: 205 82% 48%;
+  --panel: 0 0% 100%;
+  --bubble-a: 151 80% 72%;
+  --bubble-b: 204 90% 70%;
+}
+
+[data-theme="violet"] {
+  --background: 250 45% 98%;
+  --foreground: 253 34% 15%;
+  --muted: 250 36% 93%;
+  --border: 249 28% 82%;
+  --primary: 255 72% 52%;
+  --accent: 190 80% 42%;
+  --panel: 0 0% 100%;
+  --bubble-a: 255 85% 75%;
+  --bubble-b: 190 82% 68%;
+}
+
+[data-theme="rose"] {
+  --background: 340 56% 98%;
+  --foreground: 338 32% 15%;
+  --muted: 340 38% 93%;
+  --border: 340 26% 82%;
+  --primary: 338 72% 46%;
+  --accent: 33 90% 55%;
+  --panel: 0 0% 100%;
+  --bubble-a: 338 86% 78%;
+  --bubble-b: 33 92% 72%;
+}
+
+[data-theme="graphite"] {
+  --background: 220 16% 10%;
+  --foreground: 210 20% 96%;
+  --muted: 220 14% 16%;
+  --border: 220 10% 28%;
+  --primary: 199 88% 62%;
+  --accent: 48 95% 58%;
+  --panel: 220 16% 12%;
+  --bubble-a: 199 86% 45%;
+  --bubble-b: 48 94% 48%;
+}
+
+[data-theme="matrix"] {
+  --background: 146 35% 8%;
+  --foreground: 138 38% 92%;
+  --muted: 146 28% 14%;
+  --border: 144 20% 27%;
+  --primary: 139 70% 46%;
+  --accent: 190 70% 54%;
+  --panel: 145 31% 10%;
+  --bubble-a: 139 78% 45%;
+  --bubble-b: 190 80% 48%;
+}
+
+[data-theme="amber"] {
+  --background: 45 70% 97%;
+  --foreground: 35 34% 14%;
+  --muted: 43 45% 90%;
+  --border: 38 30% 78%;
+  --primary: 29 86% 43%;
+  --accent: 196 86% 42%;
+  --panel: 0 0% 100%;
+  --bubble-a: 33 92% 72%;
+  --bubble-b: 196 86% 70%;
+}
+
+[data-theme="mono"] {
+  --background: 0 0% 98%;
+  --foreground: 225 10% 12%;
+  --muted: 220 12% 92%;
+  --border: 220 10% 78%;
+  --primary: 220 12% 22%;
+  --accent: 199 80% 45%;
+  --panel: 0 0% 100%;
+  --bubble-a: 220 12% 75%;
+  --bubble-b: 199 82% 72%;
 }
 
 .dark {
@@ -30,8 +153,24 @@ body {
   color: hsl(var(--foreground));
 }
 
+body::before {
+  pointer-events: none;
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(circle at 8% 12%, hsl(var(--bubble-a) / 0.28), transparent 26%),
+    radial-gradient(circle at 90% 14%, hsl(var(--bubble-b) / 0.22), transparent 24%),
+    radial-gradient(circle at 72% 88%, hsl(var(--bubble-a) / 0.16), transparent 28%);
+}
+
+.glass-panel {
+  background: hsl(var(--panel) / 0.92);
+  box-shadow: 0 18px 60px hsl(var(--foreground) / 0.08);
+}
+
 :focus-visible {
   outline: 3px solid hsl(var(--accent));
   outline-offset: 2px;
 }
-
