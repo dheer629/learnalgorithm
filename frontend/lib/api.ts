@@ -1,4 +1,4 @@
-import type { AlgorithmDetail, AlgorithmSummary, Category, ExecuteResult } from "@/lib/types";
+import type { AlgorithmDetail, AlgorithmSummary, Category, ExecuteResult, VisualizeResult } from "@/lib/types";
 
 const BROWSER_API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
 const SERVER_API_URL = process.env.SERVER_API_URL ?? BROWSER_API_URL;
@@ -41,6 +41,12 @@ export const api = {
     fetchJson<ExecuteResult>("/execute", {
       method: "POST",
       body: JSON.stringify({ code, stdin, args: [] }),
+      next: { revalidate: 0 }
+    }),
+  visualize: (code: string, stdin = "", maxSteps = 120) =>
+    fetchJson<VisualizeResult>("/visualize", {
+      method: "POST",
+      body: JSON.stringify({ code, stdin, args: [], max_steps: maxSteps }),
       next: { revalidate: 0 }
     })
 };

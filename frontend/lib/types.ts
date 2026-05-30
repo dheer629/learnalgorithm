@@ -55,3 +55,37 @@ export type ExecuteResult = {
   exit_code?: number | null;
   logs: string[];
 };
+
+export type TraceValue = {
+  name: string;
+  kind: string;
+  preview: string;
+  size?: number | null;
+  items: Array<Record<string, unknown>>;
+  numeric_items: number[];
+};
+
+export type TraceStep = {
+  index: number;
+  event: string;
+  line_no?: number | null;
+  line_text: string;
+  function: string;
+  locals: TraceValue[];
+  stdout: string;
+  stderr: string;
+  narration: string;
+};
+
+export type VisualizeResult = {
+  stdout: string;
+  stderr: string;
+  output: string;
+  execution_time_ms: number | null;
+  status: string;
+  runner: string;
+  python_version?: string | null;
+  exit_code?: number | null;
+  steps: TraceStep[];
+  logs: string[];
+};

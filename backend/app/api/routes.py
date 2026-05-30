@@ -6,10 +6,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.models.algorithm import Algorithm, Category
-from app.schemas.algorithm import AlgorithmDetailOut, AlgorithmListOut, CategoryOut, ExecuteRequest, ExecuteResponse
+from app.schemas.algorithm import (
+    AlgorithmDetailOut,
+    AlgorithmListOut,
+    CategoryOut,
+    ExecuteRequest,
+    ExecuteResponse,
+    VisualizeRequest,
+    VisualizeResponse,
+)
 from app.services.examples import build_validated_examples
 from app.services.executor import UnsafeCodeError, execute_python
 from app.services.ingestion import sync_repository
+from app.services.visualizer import visualize_python
 
 router = APIRouter()
 
@@ -139,6 +148,14 @@ async def algorithm(slug: str, db: AsyncSession = Depends(get_db)) -> AlgorithmD
 async def execute(payload: ExecuteRequest, request: Request) -> ExecuteResponse:
     try:
         return await execute_python(payload)
+    except UnsafeCodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/visualize", response_model=VisualizeResponse)
+async def visualize(payload: VisualizeRequest, request: Request) -> VisualizeResponse:
+    try:
+        return await visualize_python(payload)
     except UnsafeCodeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

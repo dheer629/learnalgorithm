@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -66,4 +68,45 @@ class ExecuteResponse(BaseModel):
     runner: str = "unknown"
     python_version: str | None = None
     exit_code: int | None = None
+    logs: list[str] = Field(default_factory=list)
+
+
+class VisualizeRequest(BaseModel):
+    code: str
+    stdin: str = ""
+    args: list[str] = Field(default_factory=list)
+    max_steps: int = Field(default=120, ge=1, le=300)
+
+
+class TraceValueOut(BaseModel):
+    name: str
+    kind: str
+    preview: str
+    size: int | None = None
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    numeric_items: list[float] = Field(default_factory=list)
+
+
+class TraceStepOut(BaseModel):
+    index: int
+    event: str
+    line_no: int | None = None
+    line_text: str = ""
+    function: str = "<module>"
+    locals: list[TraceValueOut] = Field(default_factory=list)
+    stdout: str = ""
+    stderr: str = ""
+    narration: str = ""
+
+
+class VisualizeResponse(BaseModel):
+    status: str = "completed"
+    runner: str = "local-python-trace"
+    python_version: str | None = None
+    exit_code: int | None = None
+    execution_time_ms: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    output: str = ""
+    steps: list[TraceStepOut] = Field(default_factory=list)
     logs: list[str] = Field(default_factory=list)

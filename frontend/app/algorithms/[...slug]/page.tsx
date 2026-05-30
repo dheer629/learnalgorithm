@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { AlgorithmVisualLab } from "@/components/algorithm-visual-lab";
 import { CodeRunner } from "@/components/code-runner";
 import { LearningGuide } from "@/components/learning-guide";
 import { api } from "@/lib/api";
@@ -76,6 +77,10 @@ export default async function AlgorithmPage({ params }: { params: { slug: string
         </div>
       </section>
       <LearningGuide guide={guide} />
+      <section className="grid gap-3">
+        <h2 className="text-2xl font-semibold">Visualize the Process</h2>
+        <AlgorithmVisualLab sourceCode={algorithm.source_code} samples={samples} />
+      </section>
       <section className="grid gap-3">
         <h2 className="text-2xl font-semibold">Run and Experiment</h2>
         <CodeRunner sourceCode={algorithm.source_code} sample={guide.example} samples={samples} />
