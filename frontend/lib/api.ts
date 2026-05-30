@@ -14,7 +14,16 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     next: { revalidate: 60 }
   });
   if (!response.ok) {
-    throw new Error(`API request failed: ${response.status}`);
+    let message = `API request failed: ${response.status}`;
+    try {
+      const payload = await response.json();
+      if (typeof payload.detail === "string") {
+        message = payload.detail;
+      }
+    } catch {
+      // Keep the status-based message when the API does not return JSON.
+    }
+    throw new Error(message);
   }
   return response.json() as Promise<T>;
 }

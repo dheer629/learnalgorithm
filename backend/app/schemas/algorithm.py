@@ -23,12 +23,25 @@ class AlgorithmListOut(BaseModel):
     difficulty: str
 
 
+class AlgorithmExampleOut(BaseModel):
+    title: str
+    command: str
+    runnable_code: str
+    stdin: str = ""
+    expected_output: str = ""
+    actual_output: str = ""
+    matched: bool | None = None
+    status: str
+    validation_error: str | None = None
+
+
 class AlgorithmDetailOut(AlgorithmListOut):
     source_path: str
     source_url: str
     source_code: str
     functions: list[dict]
     doctests: list[str]
+    examples: list[AlgorithmExampleOut] = Field(default_factory=list)
     complexity: dict
     related: list[AlgorithmListOut] = Field(default_factory=list)
 
@@ -44,3 +57,4 @@ class ExecuteResponse(BaseModel):
     stderr: str
     output: str
     execution_time_ms: int | None = None
+

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.models.algorithm import Algorithm, Category
 from app.schemas.algorithm import AlgorithmDetailOut, AlgorithmListOut, CategoryOut, ExecuteRequest, ExecuteResponse
+from app.services.examples import build_validated_examples
 from app.services.executor import UnsafeCodeError, execute_python
 from app.services.ingestion import sync_repository
 
@@ -21,6 +22,51 @@ async def health() -> dict:
 @router.post("/admin/sync")
 async def sync(db: AsyncSession = Depends(get_db)) -> dict:
     return await sync_repository(db, Path("data/upstream"))
+
+
+@router.post("/admin/validate-examples")
+async def validate_examples(db: AsyncSession = Depends(get_db)) -> dict:
+    rows = (await db.execute(select(Algorithm).order_by(Algorithm.name))).scalars().all()
+    summary = {
+        "algorithms_checked": 0,
+        "examples_checked": 0,
+        "matched": 0,
+        "not_matched": 0,
+        "blocked": 0,
+        "failed": 0,
+        "without_examples": 0,
+        "failures": [],
+    }
+    for algorithm_model in rows:
+        examples = await build_validated_examples(algorithm_model.source_code)
+        summary["algorithms_checked"] += 1
+        if not examples:
+            summary["without_examples"] += 1
+            continue
+        for example in examples:
+            summary["examples_checked"] += 1
+            if example.status == "matched":
+                summary["matched"] += 1
+            elif example.status == "blocked":
+                summary["blocked"] += 1
+            elif example.status == "failed":
+                summary["failed"] += 1
+            elif example.status == "not-matched":
+                summary["not_matched"] += 1
+            if example.status in {"not-matched", "blocked", "failed"}:
+                summary["failures"].append(
+                    {
+                        "algorithm": algorithm_model.name,
+                        "slug": algorithm_model.slug,
+                        "example": example.title,
+                        "status": example.status,
+                        "command": example.command,
+                        "expected": example.expected_output,
+                        "actual": example.actual_output,
+                        "error": example.validation_error,
+                    }
+                )
+    return summary
 
 
 @router.get("/categories", response_model=list[CategoryOut])
@@ -77,6 +123,7 @@ async def algorithm(slug: str, db: AsyncSession = Depends(get_db)) -> AlgorithmD
         source_code=algorithm_model.source_code,
         functions=algorithm_model.functions,
         doctests=algorithm_model.doctests,
+        examples=await build_validated_examples(algorithm_model.source_code),
         complexity=algorithm_model.complexity,
         related=[_list_out(item, item_category) for item, item_category in related_rows],
     )

@@ -1,12 +1,26 @@
 import Link from "next/link";
 import { CodeRunner } from "@/components/code-runner";
+import { LearningGuide } from "@/components/learning-guide";
 import { api } from "@/lib/api";
+import { buildLearningGuide } from "@/lib/learning";
 
 export const dynamic = "force-dynamic";
 
 export default async function AlgorithmPage({ params }: { params: { slug: string[] } }) {
   const slug = params.slug.join("/");
   const algorithm = await api.algorithm(slug);
+  const guide = buildLearningGuide(algorithm);
+  const samples = algorithm.examples.map((example) => ({
+    title: example.title,
+    command: example.command,
+    code: example.runnable_code,
+    stdin: example.stdin,
+    expectedOutput: example.expected_output,
+    actualOutput: example.actual_output,
+    matched: example.matched,
+    status: example.status,
+    validationError: example.validation_error
+  }));
   return (
     <article className="grid gap-8">
       <nav className="text-sm text-foreground/70">
@@ -56,9 +70,10 @@ export default async function AlgorithmPage({ params }: { params: { slug: string
           </ul>
         </div>
       </section>
+      <LearningGuide guide={guide} />
       <section className="grid gap-3">
         <h2 className="text-2xl font-semibold">Run and Experiment</h2>
-        <CodeRunner sourceCode={algorithm.source_code} />
+        <CodeRunner sourceCode={algorithm.source_code} sample={guide.example} samples={samples} />
       </section>
       {algorithm.doctests.length > 0 && (
         <section className="grid gap-3">

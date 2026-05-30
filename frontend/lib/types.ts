@@ -22,7 +22,19 @@ export type AlgorithmDetail = AlgorithmSummary & {
   source_code: string;
   functions: Array<{ name: string; signature: string; docstring?: string; lineno: number }>;
   doctests: string[];
+  examples: AlgorithmExample[];
   complexity: { time?: string | null; space?: string | null };
   related: AlgorithmSummary[];
 };
 
+export type AlgorithmExample = {
+  title: string;
+  command: string;
+  runnable_code: string;
+  stdin: string;
+  expected_output: string;
+  actual_output: string;
+  matched: boolean | null;
+  status: "matched" | "not-matched" | "ran" | "blocked" | "failed" | string;
+  validation_error?: string | null;
+};

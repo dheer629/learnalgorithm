@@ -15,10 +15,7 @@ class UnsafeCodeError(ValueError):
 
 
 async def execute_python(payload: ExecuteRequest) -> ExecuteResponse:
-    if len(payload.code) > 30_000:
-        raise UnsafeCodeError("Code is too large for the shared sandbox.")
-    if any(token in payload.code for token in BLOCKED_TOKENS):
-        raise UnsafeCodeError("This code uses APIs that are disabled in the learning sandbox.")
+    validate_code(payload.code)
 
     settings = get_settings()
     started = time.perf_counter()
@@ -38,7 +35,7 @@ async def execute_python(payload: ExecuteRequest) -> ExecuteResponse:
             )
             response.raise_for_status()
         except (httpx.HTTPError, ValueError):
-            return await _execute_local(payload, started, settings.execution_timeout_seconds)
+            return await execute_python_local(payload, started, settings.execution_timeout_seconds)
     elapsed = int((time.perf_counter() - started) * 1000)
     result = response.json().get("run", {}) if response else {}
     return ExecuteResponse(
@@ -49,7 +46,15 @@ async def execute_python(payload: ExecuteRequest) -> ExecuteResponse:
     )
 
 
-async def _execute_local(payload: ExecuteRequest, started: float, timeout_seconds: int) -> ExecuteResponse:
+async def execute_python_local(
+    payload: ExecuteRequest,
+    started: float | None = None,
+    timeout_seconds: int | None = None,
+) -> ExecuteResponse:
+    validate_code(payload.code)
+    settings = get_settings()
+    started = started or time.perf_counter()
+    timeout_seconds = timeout_seconds or settings.execution_timeout_seconds
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-I",
@@ -85,3 +90,10 @@ async def _execute_local(payload: ExecuteRequest, started: float, timeout_second
         output=stdout_text + stderr_text,
         execution_time_ms=elapsed,
     )
+
+
+def validate_code(code: str) -> None:
+    if len(code) > 30_000:
+        raise UnsafeCodeError("Code is too large for the shared sandbox.")
+    if any(token in code for token in BLOCKED_TOKENS):
+        raise UnsafeCodeError("This code uses APIs that are disabled in the learning sandbox.")
