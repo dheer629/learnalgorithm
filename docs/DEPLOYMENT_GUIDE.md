@@ -73,6 +73,8 @@ and applies:
 
 Secrets are intentionally not committed. The Flux script creates the local app secret before reconciliation.
 
+This repository uses Flux reconcile commands compatible with Flux CLI 2.4.0 and newer.
+
 ## Environment Variables
 
 Common variables:

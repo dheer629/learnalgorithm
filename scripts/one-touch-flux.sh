@@ -82,8 +82,8 @@ if [ "$USE_FLUXONM" = "true" ] && command -v FLUXONM >/dev/null 2>&1; then
 fi
 
 echo "Reconciling Flux source and application..."
-flux reconcile source git learnalgorithm-repo -n flux-system --with-source
-flux reconcile kustomization learnalgorithm-app -n flux-system --with-source
+flux reconcile source git learnalgorithm-repo -n flux-system
+flux reconcile kustomization learnalgorithm-app -n flux-system
 
 echo "Waiting for app resources..."
 kubectl -n "$NAMESPACE" rollout status deploy/redis --timeout=180s

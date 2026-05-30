@@ -31,6 +31,6 @@ git push
 echo "Committed and pushed: $COMMIT_SHA"
 
 if command -v flux >/dev/null 2>&1; then
-  flux reconcile source git learnalgorithm-repo -n flux-system --with-source || true
-  flux reconcile kustomization learnalgorithm-app -n flux-system --with-source || true
+  flux reconcile source git learnalgorithm-repo -n flux-system || true
+  flux reconcile kustomization learnalgorithm-app -n flux-system || true
 fi
