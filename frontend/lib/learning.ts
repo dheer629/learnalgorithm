@@ -68,7 +68,7 @@ function buildWhenToUse(algorithm: AlgorithmDetail) {
 }
 
 function buildExampleCode(sourceCode: string, command: string) {
-  const runnableCommand = needsPrint(command) ? `print(${command})` : command;
+  const runnableCommand = needsPrint(command) ? `print(repr(${command}))` : command;
   return `${sourceCode.trimEnd()}\n\nif __name__ == "__main__":\n    ${runnableCommand}`;
 }
 

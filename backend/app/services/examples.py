@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass
 
@@ -94,14 +95,56 @@ def parse_doctest_examples(source_code: str) -> list[ParsedExample]:
 
 def build_runnable_code(source_code: str, command: str) -> str:
     command = command.strip()
-    runnable_command = command if _is_statement(command) else f"print({command})"
+    prepared_source = _remove_top_level_demo_code(source_code)
+    runnable_command = command if _is_statement(command) else f"print(repr({command}))"
     indented = "\n".join(f"    {line}" if line.strip() else line for line in runnable_command.splitlines())
-    return f"{source_code.rstrip()}\n\nif __name__ == \"__main__\":\n{indented}\n"
+    return f"{prepared_source.rstrip()}\n\nif __name__ == \"__main__\":\n{indented}\n"
 
 
 def _is_statement(command: str) -> bool:
     starts = ("print(", "assert ", "for ", "while ", "if ", "try:", "with ", "def ", "class ")
-    return command.startswith(starts) or "=" in command
+    return command.startswith(starts) or bool(re.search(r"(?<![<>=!])=(?!=)", command))
+
+
+def _remove_top_level_demo_code(source_code: str) -> str:
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return source_code
+
+    filtered_body: list[ast.stmt] = []
+    for node in tree.body:
+        if _is_main_guard(node) or _is_top_level_demo_call(node):
+            continue
+        filtered_body.append(node)
+
+    tree.body = filtered_body
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+def _is_main_guard(node: ast.stmt) -> bool:
+    if not isinstance(node, ast.If):
+        return False
+    test = node.test
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 or len(test.comparators) != 1:
+        return False
+    left = test.left
+    right = test.comparators[0]
+    return (
+        isinstance(test.ops[0], ast.Eq)
+        and isinstance(left, ast.Name)
+        and left.id == "__name__"
+        and isinstance(right, ast.Constant)
+        and right.value == "__main__"
+    )
+
+
+def _is_top_level_demo_call(node: ast.stmt) -> bool:
+    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+        return False
+    func = node.value.func
+    return isinstance(func, ast.Name) and func.id in {"main", "demo", "test"}
 
 
 def _is_docstring_boundary(line: str) -> bool:
