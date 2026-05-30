@@ -21,14 +21,19 @@ def slugify(value: str) -> str:
 async def sync_repository(session: AsyncSession, repo_dir: Path) -> dict:
     repo_path = _ensure_repo(repo_dir)
     count = 0
+    skipped = 0
     for file_path in repo_path.rglob("*.py"):
         if _skip(file_path, repo_path):
             continue
         relative = file_path.relative_to(repo_path)
+        try:
+            parsed = parse_python_file(file_path)
+        except SyntaxError:
+            skipped += 1
+            continue
         category_name = relative.parts[0].replace("_", " ").title()
         category_slug = slugify(relative.parts[0])
         category = await _get_or_create_category(session, category_slug, category_name)
-        parsed = parse_python_file(file_path)
         slug = slugify("/".join(relative.with_suffix("").parts))
         result = await session.execute(select(Algorithm).where(Algorithm.source_path == str(relative)))
         algorithm = result.scalar_one_or_none() or Algorithm(source_path=str(relative))
@@ -54,7 +59,7 @@ async def sync_repository(session: AsyncSession, repo_dir: Path) -> dict:
         )
     )
     await session.commit()
-    return {"synced": count, "repo": str(repo_path)}
+    return {"synced": count, "skipped": skipped, "repo": str(repo_path)}
 
 
 def _ensure_repo(repo_dir: Path) -> Path:
