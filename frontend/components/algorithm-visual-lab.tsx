@@ -317,7 +317,7 @@ function TraceScene({ step }: { step: TraceStep | null }) {
     const height = mount.clientHeight || 320;
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 100);
-    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, preserveDrawingBuffer: true });
     const group = new THREE.Group();
     const colorA = new THREE.Color("#38bdf8");
     const colorB = new THREE.Color("#14b8a6");
