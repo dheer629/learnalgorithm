@@ -5,11 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 MODE="docker"
+EXTRA_ARGS=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --mode)
       MODE="${2:-}"
       shift 2
+      ;;
+    --use-fluxonm)
+      EXTRA_ARGS+=("$1")
+      shift
       ;;
     *)
       echo "Unknown argument: $1"
@@ -44,11 +49,11 @@ case "$MODE" in
     "$ROOT_DIR/scripts/one-touch-k8s.sh"
     ;;
   flux)
-    "$ROOT_DIR/scripts/one-touch-flux.sh"
+    "$ROOT_DIR/scripts/one-touch-flux.sh" "${EXTRA_ARGS[@]}"
     ;;
   full)
     "$ROOT_DIR/scripts/one-touch-docker.sh"
     "$ROOT_DIR/scripts/one-touch-k8s.sh"
-    "$ROOT_DIR/scripts/one-touch-flux.sh"
+    "$ROOT_DIR/scripts/one-touch-flux.sh" "${EXTRA_ARGS[@]}"
     ;;
 esac

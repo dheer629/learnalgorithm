@@ -17,8 +17,14 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-local-admin-token}"
 "$ROOT_DIR/scripts/check-prereqs.sh" k8s
 
 echo "Building local images..."
-docker build -t "$BACKEND_IMAGE" backend
-docker build -t "$FRONTEND_IMAGE" -f frontend/Dockerfile .
+BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUILD_DIR"' EXIT
+git archive HEAD | tar -x -C "$BUILD_DIR"
+export DOCKER_CONFIG="$BUILD_DIR/.docker"
+mkdir -p "$DOCKER_CONFIG"
+printf '{}\n' >"$DOCKER_CONFIG/config.json"
+docker build -t "$BACKEND_IMAGE" "$BUILD_DIR/backend"
+docker build -t "$FRONTEND_IMAGE" -f "$BUILD_DIR/frontend/Dockerfile" "$BUILD_DIR"
 
 CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
 if echo "$CONTEXT" | grep -qi kind && command -v kind >/dev/null 2>&1; then
