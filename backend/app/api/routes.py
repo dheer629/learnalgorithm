@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +25,11 @@ async def sync(db: AsyncSession = Depends(get_db)) -> dict:
 
 
 @router.post("/admin/validate-examples")
-async def validate_examples(db: AsyncSession = Depends(get_db)) -> dict:
+async def validate_examples(
+    include_failures: bool = Query(default=False),
+    failure_limit: int = Query(default=25, ge=0, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     rows = (await db.execute(select(Algorithm).order_by(Algorithm.name))).scalars().all()
     summary = {
         "algorithms_checked": 0,
@@ -53,7 +57,9 @@ async def validate_examples(db: AsyncSession = Depends(get_db)) -> dict:
                 summary["failed"] += 1
             elif example.status == "not-matched":
                 summary["not_matched"] += 1
-            if example.status in {"not-matched", "blocked", "failed"}:
+            if include_failures and example.status in {"not-matched", "blocked", "failed"}:
+                if len(summary["failures"]) >= failure_limit:
+                    continue
                 summary["failures"].append(
                     {
                         "algorithm": algorithm_model.name,
