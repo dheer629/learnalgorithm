@@ -31,14 +31,14 @@ spec:
               value: http://learnalgorithm-backend:8000/api
           readinessProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
           livenessProbe:
             httpGet:
-              path: /
+              path: /health
               port: http
             initialDelaySeconds: 25
             periodSeconds: 20

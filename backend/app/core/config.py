@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import AnyHttpUrl, Field, field_validator
+from pydantic import AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="postgresql+asyncpg://algolearn:algolearn@localhost:5432/algolearn")
     redis_url: str = "redis://localhost:6379/0"
     frontend_origin: str = "http://localhost:3000"
-    cors_origins: list[str] = Field(default_factory=list)
+    cors_origins: str = ""
     admin_token: str | None = None
     sentry_dsn: str | None = None
     piston_url: AnyHttpUrl = "https://emkc.org/api/v2/piston/execute"
@@ -24,18 +24,9 @@ class Settings(BaseSettings):
     rate_limit_execute: str = "30/minute"
     rate_limit_admin: str = "12/minute"
 
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, value: str | list[str] | None) -> list[str]:
-        if value is None or value == "":
-            return []
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
-
     @property
     def allowed_origins(self) -> list[str]:
-        origins = self.cors_origins or [self.frontend_origin]
+        origins = [item.strip() for item in self.cors_origins.split(",") if item.strip()] or [self.frontend_origin]
         return sorted(set(origins))
 
 
