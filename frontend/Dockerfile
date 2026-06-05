@@ -30,7 +30,10 @@ COPY --from=builder /app/frontend/package.json frontend/package.json
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/frontend/.next frontend/.next
 COPY --from=builder /app/frontend/next.config.mjs frontend/next.config.mjs
-RUN addgroup -S app && adduser -S app -G app
+RUN addgroup -S app \
+    && adduser -S app -G app \
+    && mkdir -p frontend/.next/cache \
+    && chown -R app:app frontend/.next/cache
 USER app
 
 EXPOSE 3000

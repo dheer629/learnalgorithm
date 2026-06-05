@@ -3,6 +3,16 @@ import type { AlgorithmDetail, AlgorithmSearchResult, AlgorithmSummary, Category
 const BROWSER_API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
 const SERVER_API_URL = process.env.SERVER_API_URL ?? BROWSER_API_URL;
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 function apiUrl() {
   return typeof window === "undefined" ? SERVER_API_URL : BROWSER_API_URL;
 }
@@ -23,7 +33,7 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based message when the API does not return JSON.
     }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return response.json() as Promise<T>;
 }

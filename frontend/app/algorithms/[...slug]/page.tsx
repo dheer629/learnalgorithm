@@ -1,12 +1,18 @@
 import { AlgorithmWorkspace } from "@/components/algorithm-workspace";
-import { api } from "@/lib/api";
+import { notFound } from "next/navigation";
+import { ApiError, api } from "@/lib/api";
 import { buildLearningGuide } from "@/lib/learning";
 
 export const dynamic = "force-dynamic";
 
-export default async function AlgorithmPage({ params }: { params: { slug: string[] } }) {
-  const slug = params.slug.join("/");
-  const algorithm = await api.algorithm(slug);
+type AlgorithmPageProps = {
+  params: Promise<{ slug: string[] }>;
+};
+
+export default async function AlgorithmPage({ params }: AlgorithmPageProps) {
+  const { slug: slugParts } = await params;
+  const slug = slugParts.join("/");
+  const algorithm = await loadAlgorithm(slug);
   const guide = buildLearningGuide(algorithm);
   const samples = algorithm.examples.map((example) => ({
     title: example.title,
@@ -26,4 +32,15 @@ export default async function AlgorithmPage({ params }: { params: { slug: string
   }));
 
   return <AlgorithmWorkspace algorithm={algorithm} guide={guide} samples={samples} />;
+}
+
+async function loadAlgorithm(slug: string) {
+  try {
+    return await api.algorithm(slug);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      notFound();
+    }
+    throw error;
+  }
 }
