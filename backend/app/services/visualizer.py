@@ -6,7 +6,7 @@ import time
 
 from app.core.config import get_settings
 from app.schemas.algorithm import VisualizeRequest, VisualizeResponse
-from app.services.executor import validate_code
+from app.services.executor import _platform_resource_kwargs, validate_code
 
 JSON_END = "__ALGOLEARN_VISUAL_TRACE_END__"
 JSON_START = "__ALGOLEARN_VISUAL_TRACE_START__"
@@ -325,17 +325,6 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
         "Preparing an isolated Python process with line-level tracing.",
         f"Max trace steps: {payload.max_steps}.",
     ]
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        "-c",
-        VISUALIZER_SCRIPT,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=tempfile.gettempdir(),
-        env={"PYTHONIOENCODING": "utf-8"},
-    )
     request = json.dumps(
         {
             "code": payload.code,
@@ -345,26 +334,39 @@ async def visualize_python(payload: VisualizeRequest) -> VisualizeResponse:
             "max_output": settings.execution_output_limit_bytes,
         }
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(request.encode()),
-            timeout=settings.execution_timeout_seconds + 2,
+    with tempfile.TemporaryDirectory(prefix="algolearn-visual-") as temp_dir:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-I",
+            "-c",
+            VISUALIZER_SCRIPT,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=temp_dir,
+            env={"PYTHONIOENCODING": "utf-8"},
+            **_platform_resource_kwargs(settings.local_memory_limit_mb),
         )
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        elapsed = int((time.perf_counter() - started) * 1000)
-        logs.append(f"Visualization exceeded timeout of {settings.execution_timeout_seconds + 2} seconds.")
-        return VisualizeResponse(
-            status="timeout",
-            runner="local-python-trace",
-            python_version=sys.version.split()[0],
-            exit_code=None,
-            execution_time_ms=elapsed,
-            stderr=f"Visualization timed out after {settings.execution_timeout_seconds + 2} seconds.",
-            output=f"Visualization timed out after {settings.execution_timeout_seconds + 2} seconds.",
-            logs=logs,
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(request.encode()),
+                timeout=settings.execution_timeout_seconds + 2,
+            )
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            elapsed = int((time.perf_counter() - started) * 1000)
+            logs.append(f"Visualization exceeded timeout of {settings.execution_timeout_seconds + 2} seconds.")
+            return VisualizeResponse(
+                status="timeout",
+                runner="local-python-trace",
+                python_version=sys.version.split()[0],
+                exit_code=None,
+                execution_time_ms=elapsed,
+                stderr=f"Visualization timed out after {settings.execution_timeout_seconds + 2} seconds.",
+                output=f"Visualization timed out after {settings.execution_timeout_seconds + 2} seconds.",
+                logs=logs,
+            )
 
     elapsed = int((time.perf_counter() - started) * 1000)
     stdout_text = stdout.decode(errors="replace")

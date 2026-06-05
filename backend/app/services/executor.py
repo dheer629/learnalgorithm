@@ -78,19 +78,25 @@ async def execute_python(payload: ExecuteRequest) -> ExecuteResponse:
             return await execute_python_local(payload, started, settings.execution_timeout_seconds, logs)
     elapsed = int((time.perf_counter() - started) * 1000)
     result = response.json().get("run", {}) if response else {}
-    stdout = result.get("stdout", "")
-    stderr = result.get("stderr", "")
-    stdout, stdout_truncated = _truncate(stdout, settings.execution_output_limit_bytes)
-    stderr, stderr_truncated = _truncate(stderr, settings.execution_output_limit_bytes)
+    stdout_source = _as_text(result.get("stdout", ""))
+    stderr_source = _as_text(result.get("stderr", ""))
+    output_source = _as_text(result.get("output", ""))
+    if not output_source:
+        output_source = stdout_source + stderr_source
+    stdout, stdout_truncated = _truncate(stdout_source, settings.execution_output_limit_bytes)
+    stderr, stderr_truncated = _truncate(stderr_source, settings.execution_output_limit_bytes)
+    output, output_truncated = _truncate(output_source, settings.execution_output_limit_bytes)
     exit_code = result.get("code")
     status = "completed" if not stderr and exit_code in (None, 0) else "failed"
     logs.append(f"Runner finished with exit code {exit_code if exit_code is not None else 'unknown'}.")
-    if stdout_truncated or stderr_truncated:
-        logs.append(f"Output was truncated to {settings.execution_output_limit_bytes} bytes per stream.")
+    if stdout_truncated or stderr_truncated or output_truncated:
+        logs.append(
+            f"Output was truncated to {settings.execution_output_limit_bytes} bytes per stream and combined output."
+        )
     return ExecuteResponse(
         stdout=stdout,
         stderr=stderr,
-        output=result.get("output", stdout + stderr),
+        output=output,
         execution_time_ms=elapsed,
         status=status,
         runner="piston",
@@ -157,8 +163,11 @@ async def execute_python_local(
 
     stdout_text, stdout_truncated = _truncate(stdout.decode(errors="replace"), settings.execution_output_limit_bytes)
     stderr_text, stderr_truncated = _truncate(stderr.decode(errors="replace"), settings.execution_output_limit_bytes)
-    if stdout_truncated or stderr_truncated:
-        logs.append(f"Output was truncated to {settings.execution_output_limit_bytes} bytes per stream.")
+    output_text, output_truncated = _truncate(stdout_text + stderr_text, settings.execution_output_limit_bytes)
+    if stdout_truncated or stderr_truncated or output_truncated:
+        logs.append(
+            f"Output was truncated to {settings.execution_output_limit_bytes} bytes per stream and combined output."
+        )
 
     elapsed = int((time.perf_counter() - started) * 1000)
     exit_code = process.returncode
@@ -171,7 +180,7 @@ async def execute_python_local(
     return ExecuteResponse(
         stdout=stdout_text,
         stderr=stderr_text,
-        output=stdout_text + stderr_text,
+        output=output_text,
         execution_time_ms=elapsed,
         status=status,
         runner="local-python",
@@ -237,6 +246,14 @@ def _truncate(value: str, limit: int) -> tuple[str, bool]:
     if len(encoded) <= limit:
         return value, False
     return encoded[:limit].decode("utf-8", errors="replace") + "\n[truncated]\n", True
+
+
+def _as_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def _platform_resource_kwargs(memory_limit_mb: int) -> dict:

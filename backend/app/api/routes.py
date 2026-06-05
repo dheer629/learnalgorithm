@@ -35,6 +35,8 @@ router = APIRouter()
 settings = get_settings()
 
 SYNC_STATUS = SyncStatusOut()
+SYNC_LOCK = asyncio.Lock()
+SYNC_TASK: asyncio.Task | None = None
 
 
 @router.get("/health", response_model=HealthOut)
@@ -77,11 +79,18 @@ async def sync(
     _: None = Depends(require_admin_token),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    global SYNC_TASK
     if background:
-        if SYNC_STATUS.status == "running":
+        if (SYNC_TASK and not SYNC_TASK.done()) or SYNC_LOCK.locked():
             return SYNC_STATUS.model_dump()
-        asyncio.create_task(_sync_in_background(Path("data/upstream")))
+        SYNC_STATUS.status = "running"
+        SYNC_STATUS.last_started_at = datetime.now(UTC).isoformat()
+        SYNC_STATUS.last_finished_at = None
+        SYNC_STATUS.message = "Sync accepted and waiting for the background worker."
+        SYNC_TASK = asyncio.create_task(_sync_in_background(Path("data/upstream")))
         return {"status": "accepted", "message": "Sync started in the background."}
+    if SYNC_TASK and not SYNC_TASK.done():
+        return SYNC_STATUS.model_dump()
     return await _run_sync(db, Path("data/upstream"))
 
 
@@ -290,31 +299,34 @@ def _normalize_tags(tags: list[str] | None) -> list[str]:
 
 
 async def _run_sync(db: AsyncSession, repo_dir: Path) -> dict:
-    SYNC_STATUS.status = "running"
-    SYNC_STATUS.last_started_at = datetime.now(UTC).isoformat()
-    SYNC_STATUS.last_finished_at = None
-    SYNC_STATUS.message = "Sync in progress."
-    SYNC_STATUS.files_processed = 0
-    SYNC_STATUS.algorithms_updated = 0
-    SYNC_STATUS.skipped = 0
-    SYNC_STATUS.failures = []
-    try:
-        summary = await sync_repository(db, repo_dir)
-    except Exception as exc:
-        SYNC_STATUS.status = "failed"
-        SYNC_STATUS.last_finished_at = datetime.now(UTC).isoformat()
-        SYNC_STATUS.message = str(exc)
-        raise
+    if SYNC_LOCK.locked():
+        return SYNC_STATUS.model_dump()
+    async with SYNC_LOCK:
+        SYNC_STATUS.status = "running"
+        SYNC_STATUS.last_started_at = datetime.now(UTC).isoformat()
+        SYNC_STATUS.last_finished_at = None
+        SYNC_STATUS.message = "Sync in progress."
+        SYNC_STATUS.files_processed = 0
+        SYNC_STATUS.algorithms_updated = 0
+        SYNC_STATUS.skipped = 0
+        SYNC_STATUS.failures = []
+        try:
+            summary = await sync_repository(db, repo_dir)
+        except Exception as exc:
+            SYNC_STATUS.status = "failed"
+            SYNC_STATUS.last_finished_at = datetime.now(UTC).isoformat()
+            SYNC_STATUS.message = str(exc)
+            raise
 
-    SYNC_STATUS.status = "completed"
-    SYNC_STATUS.last_finished_at = datetime.now(UTC).isoformat()
-    fallback_processed = summary.get("synced", 0) + summary.get("skipped", 0)
-    SYNC_STATUS.files_processed = int(summary.get("files_processed", fallback_processed))
-    SYNC_STATUS.algorithms_updated = int(summary.get("synced", 0))
-    SYNC_STATUS.skipped = int(summary.get("skipped", 0))
-    SYNC_STATUS.failures = list(summary.get("failures", []))
-    SYNC_STATUS.message = "Sync completed."
-    return summary
+        SYNC_STATUS.status = "completed"
+        SYNC_STATUS.last_finished_at = datetime.now(UTC).isoformat()
+        fallback_processed = summary.get("synced", 0) + summary.get("skipped", 0)
+        SYNC_STATUS.files_processed = int(summary.get("files_processed", fallback_processed))
+        SYNC_STATUS.algorithms_updated = int(summary.get("synced", 0))
+        SYNC_STATUS.skipped = int(summary.get("skipped", 0))
+        SYNC_STATUS.failures = list(summary.get("failures", []))
+        SYNC_STATUS.message = "Sync completed."
+        return summary
 
 
 async def _sync_in_background(repo_dir: Path) -> None:

@@ -10,9 +10,10 @@
     "lint": "npm --workspace frontend run lint",
     "test": "npm --workspace frontend run test",
     "frontend:build": "npm --workspace frontend run build",
+    "backend:lint": "cd backend && python -m ruff check . && python -m black --check .",
     "backend:test": "cd backend && python -m pytest",
     "migrate": "cd backend && alembic upgrade head",
     "sync": "curl -X POST http://localhost:8000/api/admin/sync -H \"X-Admin-Token: local-admin-token\"",
-    "ci": "npm run lint && npm run test && npm run frontend:build"
+    "ci": "npm run backend:lint && npm run backend:test && npm run lint && npm run test && npm run frontend:build"
   }
 }
