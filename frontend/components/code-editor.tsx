@@ -1,5 +1,6 @@
 "use client";
 
+import type { editor as MonacoEditor } from "monaco-editor";
 import { useEffect, useRef, useState } from "react";
 
 export function CodeEditor({
@@ -16,7 +17,7 @@ export function CodeEditor({
   label?: string;
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const editorRef = useRef<any>(null);
+  const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const initialValueRef = useRef(value);
   const initialFontSizeRef = useRef(fontSize);
   const onChangeRef = useRef(onChange);
@@ -46,7 +47,7 @@ export function CodeEditor({
           theme: document.documentElement.dataset.theme?.includes("graphite") ? "vs-dark" : "vs",
           wordWrap: "on"
         });
-        editorRef.current.onDidChangeModelContent(() => onChangeRef.current(editorRef.current.getValue()));
+        editorRef.current.onDidChangeModelContent(() => onChangeRef.current(editorRef.current?.getValue() ?? ""));
         setReady(true);
       } catch {
         setFailed(true);

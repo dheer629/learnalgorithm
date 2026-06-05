@@ -60,6 +60,7 @@ export function AlgorithmWorkspace({
       const existing = stored ? JSON.parse(stored) : [];
       const next = [item, ...existing.filter((value: { slug: string }) => value.slug !== item.slug)].slice(0, 8);
       window.localStorage.setItem("algolearn-recent", JSON.stringify(next));
+      window.dispatchEvent(new Event("algolearn-recent-updated"));
     } catch {
       // Recently viewed is a convenience layer; ignore localStorage failures.
     }
