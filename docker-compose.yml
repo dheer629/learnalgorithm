@@ -29,6 +29,8 @@ services:
     image: ${IMAGE_REGISTRY:-}learnalgorithm-backend:${IMAGE_TAG:-local}
     build:
       context: ./backend
+      args:
+        PIP_TRUSTED_HOST_ARGS: ${PIP_TRUSTED_HOST_ARGS:-}
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-algolearn}:${POSTGRES_PASSWORD:-algolearn}@postgres:5432/${POSTGRES_DB:-algolearn}
       REDIS_URL: redis://redis:6379/0

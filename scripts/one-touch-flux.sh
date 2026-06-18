@@ -20,6 +20,7 @@ IMAGE_TAG="${IMAGE_TAG:-local}"
 IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"
 BACKEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-backend:${IMAGE_TAG}"
 FRONTEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-frontend:${IMAGE_TAG}"
+PIP_TRUSTED_HOST_ARGS="${PIP_TRUSTED_HOST_ARGS:-}"
 
 if ! command -v flux >/dev/null 2>&1; then
   cat <<'INFO'
@@ -44,13 +45,17 @@ kubectl apply -f deploy/k8s/namespace.yaml
 
 if [ -z "$IMAGE_REGISTRY" ]; then
   echo "Building local images for GitOps-applied manifests..."
+  BACKEND_BUILD_ARGS=()
+  if [ -n "$PIP_TRUSTED_HOST_ARGS" ]; then
+    BACKEND_BUILD_ARGS+=(--build-arg "PIP_TRUSTED_HOST_ARGS=$PIP_TRUSTED_HOST_ARGS")
+  fi
   BUILD_DIR="$(mktemp -d)"
   trap 'rm -rf "$BUILD_DIR"' EXIT
   git archive HEAD | tar -x -C "$BUILD_DIR"
   export DOCKER_CONFIG="$BUILD_DIR/.docker"
   mkdir -p "$DOCKER_CONFIG"
   printf '{}\n' >"$DOCKER_CONFIG/config.json"
-  docker build -t "$BACKEND_IMAGE" "$BUILD_DIR/backend"
+  docker build "${BACKEND_BUILD_ARGS[@]}" -t "$BACKEND_IMAGE" "$BUILD_DIR/backend"
   docker build -t "$FRONTEND_IMAGE" -f "$BUILD_DIR/frontend/Dockerfile" "$BUILD_DIR"
   if docker ps --format '{{.Names}}' | grep -qx 'vcluster.cp.dev'; then
     echo "Detected vcluster.cp.dev. Importing local images into vCluster containerd..."
