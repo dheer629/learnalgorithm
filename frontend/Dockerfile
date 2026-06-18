@@ -1,9 +1,14 @@
 FROM node:20-alpine AS deps
 
 WORKDIR /app
+ARG NPM_VERSION=11.13.0
+ARG NPM_CONFIG_STRICT_SSL=true
+ENV NPM_CONFIG_STRICT_SSL=${NPM_CONFIG_STRICT_SSL}
 COPY package.json package-lock.json ./
 COPY frontend/package.json frontend/package.json
-RUN npm ci
+RUN npm install -g "npm@${NPM_VERSION}"
+RUN npm ci \
+    && test -x node_modules/.bin/next
 
 FROM node:20-alpine AS builder
 WORKDIR /app

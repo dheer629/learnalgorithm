@@ -21,6 +21,7 @@ IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"
 BACKEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-backend:${IMAGE_TAG}"
 FRONTEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-frontend:${IMAGE_TAG}"
 PIP_TRUSTED_HOST_ARGS="${PIP_TRUSTED_HOST_ARGS:-}"
+NPM_CONFIG_STRICT_SSL="${NPM_CONFIG_STRICT_SSL:-true}"
 
 if ! command -v flux >/dev/null 2>&1; then
   cat <<'INFO'
@@ -49,6 +50,7 @@ if [ -z "$IMAGE_REGISTRY" ]; then
   if [ -n "$PIP_TRUSTED_HOST_ARGS" ]; then
     BACKEND_BUILD_ARGS+=(--build-arg "PIP_TRUSTED_HOST_ARGS=$PIP_TRUSTED_HOST_ARGS")
   fi
+  FRONTEND_BUILD_ARGS=(--build-arg "NPM_CONFIG_STRICT_SSL=$NPM_CONFIG_STRICT_SSL")
   BUILD_DIR="$(mktemp -d)"
   trap 'rm -rf "$BUILD_DIR"' EXIT
   git archive HEAD | tar -x -C "$BUILD_DIR"
@@ -56,7 +58,7 @@ if [ -z "$IMAGE_REGISTRY" ]; then
   mkdir -p "$DOCKER_CONFIG"
   printf '{}\n' >"$DOCKER_CONFIG/config.json"
   docker build "${BACKEND_BUILD_ARGS[@]}" -t "$BACKEND_IMAGE" "$BUILD_DIR/backend"
-  docker build -t "$FRONTEND_IMAGE" -f "$BUILD_DIR/frontend/Dockerfile" "$BUILD_DIR"
+  docker build "${FRONTEND_BUILD_ARGS[@]}" -t "$FRONTEND_IMAGE" -f "$BUILD_DIR/frontend/Dockerfile" "$BUILD_DIR"
   if docker ps --format '{{.Names}}' | grep -qx 'vcluster.cp.dev'; then
     echo "Detected vcluster.cp.dev. Importing local images into vCluster containerd..."
     docker save "$BACKEND_IMAGE" "$FRONTEND_IMAGE" | docker exec -i vcluster.cp.dev ctr -n k8s.io images import -
