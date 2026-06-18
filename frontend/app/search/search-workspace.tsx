@@ -13,19 +13,29 @@ import { usePreferences } from "@/store/preferences";
 
 const difficulties = ["beginner", "intermediate", "advanced"];
 const sortOptions = [
+  { value: "relevance", label: "Relevance" },
   { value: "name", label: "Name" },
   { value: "difficulty", label: "Difficulty" },
   { value: "category", label: "Category" },
   { value: "-name", label: "Name desc" }
 ];
 
-export function SearchWorkspace({ categories, initialQuery }: { categories: Category[]; initialQuery: string }) {
+type SearchFilters = {
+  q?: string;
+  category?: string;
+  difficulty?: string;
+  tags?: string;
+  sort?: string;
+};
+
+export function SearchWorkspace({ categories, initialFilters }: { categories: Category[]; initialFilters: SearchFilters }) {
   const { lastSearchFilters, setLastSearchFilters } = usePreferences();
-  const [q, setQ] = useState(initialQuery || lastSearchFilters.q);
-  const [category, setCategory] = useState(lastSearchFilters.category);
-  const [difficulty, setDifficulty] = useState(lastSearchFilters.difficulty);
-  const [tags, setTags] = useState(lastSearchFilters.tags);
-  const [sort, setSort] = useState(lastSearchFilters.sort || "name");
+  const [q, setQ] = useState(initialFilters.q || lastSearchFilters.q);
+  const [category, setCategory] = useState(initialFilters.category || lastSearchFilters.category);
+  const [difficulty, setDifficulty] = useState(initialFilters.difficulty || lastSearchFilters.difficulty);
+  const [tags, setTags] = useState(initialFilters.tags || lastSearchFilters.tags);
+  const [sort, setSort] = useState(initialFilters.sort || lastSearchFilters.sort || "relevance");
+  const [page, setPage] = useState(1);
   const [debouncedQuery, setDebouncedQuery] = useState(q);
 
   useEffect(() => {
@@ -38,7 +48,7 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
   }, [category, difficulty, q, setLastSearchFilters, sort, tags]);
 
   const query = useQuery({
-    queryKey: ["algorithm-search", debouncedQuery, category, difficulty, tags, sort],
+    queryKey: ["algorithm-search", debouncedQuery, category, difficulty, tags, sort, page],
     queryFn: () =>
       api.algorithmSearch({
         q: debouncedQuery,
@@ -46,7 +56,8 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
         difficulty,
         tags,
         sort,
-        pageSize: 40
+        page,
+        pageSize: 30
       })
   });
 
@@ -60,6 +71,7 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
     setDifficulty("");
     setTags("");
     setSort("name");
+    setPage(1);
   }
 
   return (
@@ -80,7 +92,10 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
             className="h-11 w-full rounded-md border border-border bg-background pl-10 pr-4 text-sm"
             placeholder="Try binary search, graph, dynamic programming, O(log n)..."
             value={q}
-            onChange={(event) => setQ(event.target.value)}
+            onChange={(event) => {
+              setQ(event.target.value);
+              setPage(1);
+            }}
           />
         </label>
 
@@ -90,7 +105,10 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
             <select
               className="h-10 rounded-md border border-border bg-background px-3 text-sm"
               value={category}
-              onChange={(event) => setCategory(event.target.value)}
+              onChange={(event) => {
+                setCategory(event.target.value);
+                setPage(1);
+              }}
             >
               <option value="">All categories</option>
               {categories.map((item) => (
@@ -105,7 +123,10 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
             <select
               className="h-10 rounded-md border border-border bg-background px-3 text-sm"
               value={difficulty}
-              onChange={(event) => setDifficulty(event.target.value)}
+              onChange={(event) => {
+                setDifficulty(event.target.value);
+                setPage(1);
+              }}
             >
               <option value="">Any difficulty</option>
               {difficulties.map((item) => (
@@ -121,7 +142,10 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
               className="h-10 rounded-md border border-border bg-background px-3 text-sm"
               placeholder="heap, math, recursion"
               value={tags}
-              onChange={(event) => setTags(event.target.value)}
+              onChange={(event) => {
+                setTags(event.target.value);
+                setPage(1);
+              }}
             />
           </label>
           <label className="grid gap-2 text-sm font-semibold">
@@ -129,7 +153,10 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
             <select
               className="h-10 rounded-md border border-border bg-background px-3 text-sm"
               value={sort}
-              onChange={(event) => setSort(event.target.value)}
+              onChange={(event) => {
+                setSort(event.target.value);
+                setPage(1);
+              }}
             >
               {sortOptions.map((item) => (
                 <option key={item.value} value={item.value}>
@@ -191,9 +218,29 @@ export function SearchWorkspace({ categories, initialQuery }: { categories: Cate
 
       {!query.isLoading && result?.items.length ? (
         <section className="grid gap-3" aria-label="Search results">
-          <div className="flex items-center gap-2 text-sm font-semibold text-foreground/70">
-            <SlidersHorizontal className="h-4 w-4" aria-hidden />
-            Showing {result.items.length} of {result.meta.total}
+          <div className="flex flex-wrap items-center justify-between gap-3 text-sm font-semibold text-foreground/70">
+            <span className="flex items-center gap-2">
+              <SlidersHorizontal className="h-4 w-4" aria-hidden />
+              Showing {result.items.length} of {result.meta.total} on page {result.meta.page} of {result.meta.total_pages}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                className="rounded-md border border-border px-3 py-2 disabled:cursor-not-allowed disabled:opacity-45"
+                type="button"
+                disabled={!result.meta.has_previous}
+                onClick={() => setPage((value) => Math.max(1, value - 1))}
+              >
+                Previous
+              </button>
+              <button
+                className="rounded-md border border-border px-3 py-2 disabled:cursor-not-allowed disabled:opacity-45"
+                type="button"
+                disabled={!result.meta.has_next}
+                onClick={() => setPage((value) => value + 1)}
+              >
+                Next
+              </button>
+            </div>
           </div>
           {result.items.map((algorithm) => (
             <Link key={algorithm.id} href={`/algorithms/${algorithm.slug}`}>

@@ -32,11 +32,36 @@ class SearchMetaOut(BaseModel):
     offset: int
     limit: int
     sort: str
+    q: str | None = None
+    total_pages: int
+    has_next: bool
+    has_previous: bool
 
 
 class AlgorithmSearchOut(BaseModel):
     items: list[AlgorithmListOut]
     meta: SearchMetaOut
+
+
+class DifficultyCountOut(BaseModel):
+    difficulty: str
+    count: int
+
+
+class TagCountOut(BaseModel):
+    tag: str
+    count: int
+
+
+class DiscoveryOut(BaseModel):
+    algorithms_total: int
+    categories_total: int
+    functions_total: int
+    doctests_total: int
+    categories: list[CategoryOut]
+    difficulties: list[DifficultyCountOut]
+    top_tags: list[TagCountOut]
+    starters: list[AlgorithmListOut]
 
 
 class AlgorithmExampleOut(BaseModel):

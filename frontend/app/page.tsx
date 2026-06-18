@@ -17,8 +17,9 @@ const learningPaths = [
 ];
 
 export default async function HomePage() {
-  const categories = await api.categories();
-  const recommended = await api.algorithms({ pageSize: 6, sort: "name" });
+  const discovery = await api.discovery();
+  const categories = discovery.categories;
+  const recommended = discovery.starters;
   return (
     <div className="grid gap-10">
       <section className="grid min-h-[420px] content-center gap-6 rounded-lg border border-border bg-panel/95 p-6 shadow-sm md:p-10">
@@ -49,10 +50,16 @@ export default async function HomePage() {
           </Link>
         </div>
         <div className="grid gap-3 border-t border-border pt-5 sm:grid-cols-4">
-          {["Learn", "Inspect", "Run", "Visualize"].map((item) => (
-            <div key={item} className="flex items-center gap-2 text-sm font-semibold text-foreground/75">
+          {[
+            ["Algorithms", formatNumber(discovery.algorithms_total)],
+            ["Functions", formatNumber(discovery.functions_total)],
+            ["Doctests", formatNumber(discovery.doctests_total)],
+            ["Categories", formatNumber(discovery.categories_total)]
+          ].map(([label, value]) => (
+            <div key={label} className="flex items-center gap-2 text-sm font-semibold text-foreground/75">
               <Binary className="h-4 w-4 text-primary" aria-hidden />
-              {item}
+              <span>{value}</span>
+              <span className="text-foreground/60">{label}</span>
             </div>
           ))}
         </div>
@@ -115,6 +122,57 @@ export default async function HomePage() {
         </div>
       </section>
 
+      <section className="grid gap-4" aria-labelledby="signals-heading">
+        <div>
+          <h2 id="signals-heading" className="text-2xl font-semibold">
+            Discovery Signals
+          </h2>
+          <p className="text-sm text-foreground/70">Use metadata density to pick a sharper next step.</p>
+        </div>
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]">
+          <Card className="grid gap-3">
+            <CardHeader className="mb-0">
+              <CardTitle>Difficulty Mix</CardTitle>
+              <Badge tone="muted">{formatNumber(discovery.algorithms_total)} total</Badge>
+            </CardHeader>
+            <div className="grid gap-3">
+              {discovery.difficulties.map((item) => (
+                <div key={item.difficulty} className="grid gap-1">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="font-semibold capitalize">{item.difficulty}</span>
+                    <span className="text-foreground/65">{formatNumber(item.count)}</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full rounded-full bg-primary"
+                      style={{ width: `${Math.max(6, Math.round((item.count / discovery.algorithms_total) * 100))}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+          <Card className="grid gap-3">
+            <CardHeader className="mb-0">
+              <CardTitle>High-Signal Tags</CardTitle>
+              <Badge tone="muted">{discovery.top_tags.length} tags</Badge>
+            </CardHeader>
+            <div className="flex flex-wrap gap-2">
+              {discovery.top_tags.map((item) => (
+                <Link
+                  key={item.tag}
+                  className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-semibold hover:bg-muted"
+                  href={`/search?tags=${encodeURIComponent(item.tag)}`}
+                >
+                  {item.tag}
+                  <span className="text-foreground/55">{formatNumber(item.count)}</span>
+                </Link>
+              ))}
+            </div>
+          </Card>
+        </div>
+      </section>
+
       <section className="grid gap-3" aria-labelledby="recommended-heading">
         <h2 id="recommended-heading" className="text-2xl font-semibold">
           Recommended Starters
@@ -137,4 +195,8 @@ export default async function HomePage() {
       <SortingVisualizer />
     </div>
   );
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat("en-US").format(value);
 }

@@ -1,4 +1,12 @@
-import type { AlgorithmDetail, AlgorithmSearchResult, AlgorithmSummary, Category, ExecuteResult, VisualizeResult } from "@/lib/types";
+import type {
+  AlgorithmDetail,
+  AlgorithmSearchResult,
+  AlgorithmSummary,
+  Category,
+  Discovery,
+  ExecuteResult,
+  VisualizeResult
+} from "@/lib/types";
 
 const BROWSER_API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
 const SERVER_API_URL = process.env.SERVER_API_URL ?? BROWSER_API_URL;
@@ -40,6 +48,7 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   categories: () => fetchJson<Category[]>("/categories"),
+  discovery: () => fetchJson<Discovery>("/discovery"),
   algorithms: (params?: {
     category?: string;
     q?: string;

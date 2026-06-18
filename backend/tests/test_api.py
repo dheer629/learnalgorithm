@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from app.api.routes import _normalize_query, _normalize_tags
 from app.main import app
 
 
@@ -24,6 +25,12 @@ def test_admin_sync_requires_configured_token() -> None:
 
     assert response.status_code == 503
     assert "ADMIN_TOKEN" in response.json()["detail"]
+
+
+def test_search_filter_normalizers_trim_and_split_values() -> None:
+    assert _normalize_query("  bubble   sort  ") == "bubble sort"
+    assert _normalize_query("   ") is None
+    assert _normalize_tags(["heap, math", " recursion "]) == ["heap", "math", "recursion"]
 
 
 def test_visualize_endpoint_returns_trace_steps() -> None:

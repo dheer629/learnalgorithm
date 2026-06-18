@@ -4,7 +4,7 @@ from pathlib import Path
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import desc, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -17,12 +17,15 @@ from app.schemas.algorithm import (
     AlgorithmListOut,
     AlgorithmSearchOut,
     CategoryOut,
+    DifficultyCountOut,
+    DiscoveryOut,
     ExecuteRequest,
     ExecuteResponse,
     HealthOut,
     ReadyCheckOut,
     SearchMetaOut,
     SyncStatusOut,
+    TagCountOut,
     VisualizeRequest,
     VisualizeResponse,
 )
@@ -156,6 +159,56 @@ async def validate_examples(
 
 @router.get("/categories", response_model=list[CategoryOut])
 async def categories(db: AsyncSession = Depends(get_db)) -> list[CategoryOut]:
+    return await _category_counts(db)
+
+
+@router.get("/discovery", response_model=DiscoveryOut)
+async def discovery(db: AsyncSession = Depends(get_db)) -> DiscoveryOut:
+    category_items = await _category_counts(db)
+    algorithm_total = await db.scalar(select(func.count(Algorithm.id)))
+    function_total = await db.scalar(select(func.coalesce(func.sum(func.jsonb_array_length(Algorithm.functions)), 0)))
+    doctest_total = await db.scalar(select(func.coalesce(func.sum(func.cardinality(Algorithm.doctests)), 0)))
+
+    difficulty_rows = (
+        await db.execute(
+            select(Algorithm.difficulty, func.count(Algorithm.id))
+            .group_by(Algorithm.difficulty)
+            .order_by(desc(func.count(Algorithm.id)), Algorithm.difficulty)
+        )
+    ).all()
+    tag_subquery = select(func.unnest(Algorithm.tags).label("tag")).subquery()
+    tag_rows = (
+        await db.execute(
+            select(tag_subquery.c.tag, func.count().label("count"))
+            .where(tag_subquery.c.tag != "")
+            .group_by(tag_subquery.c.tag)
+            .order_by(desc("count"), tag_subquery.c.tag)
+            .limit(16)
+        )
+    ).all()
+    starter_rows = (
+        await db.execute(
+            select(Algorithm, Category.slug)
+            .join(Category)
+            .where(Algorithm.difficulty == "beginner")
+            .order_by(func.cardinality(Algorithm.doctests).desc(), Algorithm.name.asc())
+            .limit(6)
+        )
+    ).all()
+
+    return DiscoveryOut(
+        algorithms_total=algorithm_total or 0,
+        categories_total=len(category_items),
+        functions_total=function_total or 0,
+        doctests_total=doctest_total or 0,
+        categories=category_items,
+        difficulties=[DifficultyCountOut(difficulty=difficulty, count=count) for difficulty, count in difficulty_rows],
+        top_tags=[TagCountOut(tag=tag, count=count) for tag, count in tag_rows],
+        starters=[_list_out(algorithm, category_slug) for algorithm, category_slug in starter_rows],
+    )
+
+
+async def _category_counts(db: AsyncSession) -> list[CategoryOut]:
     query = (
         select(Category, func.count(Algorithm.id).label("algorithm_count"))
         .join(Algorithm, Algorithm.category_id == Category.id, isouter=True)
@@ -174,47 +227,61 @@ async def algorithms(
     q: str | None = None,
     difficulty: str | None = None,
     tags: list[str] | None = Query(default=None),
-    sort: str = Query(default="name", pattern="^-?(name|difficulty|category)$"),
+    sort: str = Query(default="name", pattern="^-?(name|difficulty|category|relevance)$"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=40, ge=1, le=100),
     meta: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
 ) -> list[AlgorithmListOut] | AlgorithmSearchOut:
-    query = select(Algorithm, Category.slug).join(Category)
+    normalized_query = _normalize_query(q)
+    rank_expression = literal(0.0).label("rank")
+    ts_query = None
+    if normalized_query:
+        ts_query = func.websearch_to_tsquery("english", normalized_query)
+        rank_expression = func.ts_rank_cd(Algorithm.search_vector, ts_query).label("rank")
+
+    query = select(Algorithm, Category.slug, rank_expression).join(Category)
     if category:
         query = query.where(Category.slug == category)
     if difficulty:
         query = query.where(Algorithm.difficulty == difficulty)
     for tag in _normalize_tags(tags):
         query = query.where(Algorithm.tags.contains([tag]))
-    if q:
-        like = f"%{q}%"
+    if normalized_query and ts_query is not None:
+        like = f"%{normalized_query}%"
         query = query.where(
             or_(
+                Algorithm.search_vector.op("@@")(ts_query),
                 Algorithm.name.ilike(like),
                 Algorithm.description.ilike(like),
-                Algorithm.tags.any(q),
+                func.array_to_string(Algorithm.tags, " ").ilike(like),
                 Category.name.ilike(like),
             )
         )
 
     total = await db.scalar(select(func.count()).select_from(query.subquery()))
-    query = _apply_sort(query, sort)
+    query = _apply_sort(query, sort, rank_expression, bool(normalized_query))
     offset = (page - 1) * page_size
     query = query.offset(offset).limit(page_size)
     rows = (await db.execute(query)).all()
-    items = [_list_out(algorithm, category_slug) for algorithm, category_slug in rows]
+    items = [_list_out(algorithm, category_slug) for algorithm, category_slug, _rank in rows]
+    total_count = total or 0
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
     if not meta:
         return items
     return AlgorithmSearchOut(
         items=items,
         meta=SearchMetaOut(
-            total=total or 0,
+            total=total_count,
             page=page,
             page_size=page_size,
             offset=offset,
             limit=page_size,
             sort=sort,
+            q=normalized_query,
+            total_pages=total_pages,
+            has_next=page < total_pages,
+            has_previous=page > 1,
         ),
     )
 
@@ -279,16 +346,26 @@ def _list_out(algorithm: Algorithm, category_slug: str) -> AlgorithmListOut:
     )
 
 
-def _apply_sort(query, sort: str):
+def _apply_sort(query, sort: str, rank_expression, has_query: bool):
     descending = sort.startswith("-")
     key = sort.removeprefix("-")
+    if key == "relevance" and has_query:
+        return query.order_by(rank_expression.desc(), Algorithm.name.asc())
     columns = {
         "name": Algorithm.name,
         "difficulty": Algorithm.difficulty,
         "category": Category.name,
+        "relevance": Algorithm.name,
     }
     column = columns.get(key, Algorithm.name)
     return query.order_by(column.desc() if descending else column.asc(), Algorithm.name.asc())
+
+
+def _normalize_query(q: str | None) -> str | None:
+    if not q:
+        return None
+    normalized = " ".join(q.strip().split())
+    return normalized or None
 
 
 def _normalize_tags(tags: list[str] | None) -> list[str]:

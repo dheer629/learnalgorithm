@@ -37,7 +37,22 @@ export type AlgorithmSearchResult = {
     offset: number;
     limit: number;
     sort: string;
+    q?: string | null;
+    total_pages: number;
+    has_next: boolean;
+    has_previous: boolean;
   };
+};
+
+export type Discovery = {
+  algorithms_total: number;
+  categories_total: number;
+  functions_total: number;
+  doctests_total: number;
+  categories: Category[];
+  difficulties: Array<{ difficulty: string; count: number }>;
+  top_tags: Array<{ tag: string; count: number }>;
+  starters: AlgorithmSummary[];
 };
 
 export type AlgorithmExample = {
