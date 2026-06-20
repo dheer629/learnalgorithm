@@ -80,6 +80,20 @@ flux get sources git -n flux-system
 flux logs -n flux-system --kind=GitRepository --name=learnalgorithm-repo
 ```
 
+If the error contains `x509: certificate signed by unknown authority`, the
+cluster is likely behind local HTTPS inspection. Recreate the Flux Git CA secret
+through the one-touch script:
+
+```bash
+./scripts/one-touch-deploy.sh --mode flux
+```
+
+For a custom proxy or antivirus root CA:
+
+```bash
+FLUX_GIT_CA_CERT=/path/to/local-root-ca.pem ./scripts/one-touch-deploy.sh --mode flux
+```
+
 ## Flux Kustomization Failed
 
 ```bash

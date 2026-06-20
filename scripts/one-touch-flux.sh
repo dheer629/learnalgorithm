@@ -22,6 +22,77 @@ BACKEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-backend:${IMAGE_TAG}"
 FRONTEND_IMAGE="${IMAGE_REGISTRY}learnalgorithm-frontend:${IMAGE_TAG}"
 PIP_TRUSTED_HOST_ARGS="${PIP_TRUSTED_HOST_ARGS:-}"
 NPM_CONFIG_STRICT_SSL="${NPM_CONFIG_STRICT_SSL:-true}"
+FLUX_GIT_CA_SECRET="${FLUX_GIT_CA_SECRET:-learnalgorithm-github-ca}"
+FLUX_GIT_CA_CERT="${FLUX_GIT_CA_CERT:-}"
+FLUX_AUTO_TRUST_WINDOWS_AVG="${FLUX_AUTO_TRUST_WINDOWS_AVG:-true}"
+
+append_file_if_present() {
+  local source_file="$1"
+  local target_file="$2"
+  if [ -n "$source_file" ] && [ -f "$source_file" ]; then
+    cat "$source_file" >>"$target_file"
+    printf '\n' >>"$target_file"
+    return 0
+  fi
+  return 1
+}
+
+export_windows_avg_root() {
+  local output_file="$1"
+  local der_file="${output_file}.der"
+
+  if [ "$FLUX_AUTO_TRUST_WINDOWS_AVG" != "true" ] || ! command -v powershell.exe >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local win_der_file
+  win_der_file="$(wslpath -w "$der_file")"
+  if powershell.exe -NoProfile -NonInteractive -Command "\$cert = Get-ChildItem Cert:\\CurrentUser\\Root, Cert:\\LocalMachine\\Root -ErrorAction SilentlyContinue | Where-Object { \$_.Subject -like '*AVG Web/Mail Shield Root*' } | Select-Object -First 1; if (\$cert) { Export-Certificate -Cert \$cert -FilePath '$win_der_file' -Type CERT | Out-Null; exit 0 } exit 1" >/dev/null 2>&1; then
+    if [ -s "$der_file" ] && command -v openssl >/dev/null 2>&1; then
+      openssl x509 -inform DER -in "$der_file" -out "$output_file" >/dev/null 2>&1
+      [ -s "$output_file" ]
+      return
+    fi
+  fi
+
+  return 1
+}
+
+create_flux_git_ca_secret() {
+  local bundle_file
+  bundle_file="$(mktemp)"
+  local added_local_ca="false"
+
+  if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cp /etc/ssl/certs/ca-certificates.crt "$bundle_file"
+  elif [ -n "${SSL_CERT_FILE:-}" ] && [ -f "$SSL_CERT_FILE" ]; then
+    cp "$SSL_CERT_FILE" "$bundle_file"
+  else
+    : >"$bundle_file"
+  fi
+
+  if append_file_if_present "$FLUX_GIT_CA_CERT" "$bundle_file"; then
+    added_local_ca="true"
+  fi
+
+  local avg_root_file
+  avg_root_file="$(mktemp)"
+  if export_windows_avg_root "$avg_root_file"; then
+    append_file_if_present "$avg_root_file" "$bundle_file" >/dev/null || true
+    added_local_ca="true"
+  fi
+
+  echo "Creating Flux Git CA secret: $FLUX_GIT_CA_SECRET"
+  kubectl -n flux-system delete secret "$FLUX_GIT_CA_SECRET" --ignore-not-found=true >/dev/null
+  kubectl -n flux-system create secret generic "$FLUX_GIT_CA_SECRET" --from-file=ca.crt="$bundle_file" >/dev/null
+
+  if [ "$added_local_ca" = "true" ] && docker ps --format '{{.Names}}' | grep -qx 'vcluster.cp.dev'; then
+    echo "Installing local CA into vcluster.cp.dev for controller/image pulls..."
+    docker cp "$bundle_file" vcluster.cp.dev:/usr/local/share/ca-certificates/learnalgorithm-local-ca.crt >/dev/null
+    docker exec vcluster.cp.dev update-ca-certificates >/dev/null
+    docker exec vcluster.cp.dev systemctl restart containerd >/dev/null 2>&1 || true
+  fi
+}
 
 if ! command -v flux >/dev/null 2>&1; then
   cat <<'INFO'
@@ -43,6 +114,7 @@ fi
 echo "Ensuring Flux and app namespaces exist..."
 kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f deploy/k8s/namespace.yaml
+create_flux_git_ca_secret
 
 if [ -z "$IMAGE_REGISTRY" ]; then
   echo "Building local images for GitOps-applied manifests..."

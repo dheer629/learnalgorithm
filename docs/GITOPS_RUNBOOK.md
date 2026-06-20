@@ -31,6 +31,27 @@ kubectl get pods -n learnalgorithm
 kubectl get svc -n learnalgorithm
 ```
 
+## Local TLS Inspection
+
+`deploy/flux/source-gitrepository.yaml` references the local secret
+`flux-system/learnalgorithm-github-ca`. The one-touch Flux script recreates this
+secret from the Linux CA bundle before applying Flux resources. On WSL, it also
+auto-detects the Windows `AVG Web/Mail Shield Root` certificate when present and
+adds it to the bundle so Flux can clone GitHub through local HTTPS inspection.
+
+For another antivirus, proxy, or corporate root CA, export the root certificate
+as PEM and run:
+
+```bash
+FLUX_GIT_CA_CERT=/path/to/local-root-ca.pem ./scripts/one-touch-deploy.sh --mode flux
+```
+
+To disable the AVG auto-detection:
+
+```bash
+FLUX_AUTO_TRUST_WINDOWS_AVG=false ./scripts/one-touch-deploy.sh --mode flux
+```
+
 ## Rollback
 
 ```bash
