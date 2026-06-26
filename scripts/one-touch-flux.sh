@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# shellcheck source=scripts/load-env.sh
+source "$ROOT_DIR/scripts/load-env.sh"
+load_project_env "$ROOT_DIR"
+
 USE_FLUXONM="false"
 for arg in "$@"; do
   if [ "$arg" = "--use-fluxonm" ]; then
@@ -39,23 +43,69 @@ append_file_if_present() {
 
 export_windows_avg_root() {
   local output_file="$1"
-  local der_file="${output_file}.der"
 
   if [ "$FLUX_AUTO_TRUST_WINDOWS_AVG" != "true" ] || ! command -v powershell.exe >/dev/null 2>&1; then
     return 1
   fi
 
-  local win_der_file
-  win_der_file="$(wslpath -w "$der_file")"
+  if ! powershell.exe -NoProfile -NonInteractive -Command "\$PSVersionTable.PSVersion | Out-Null" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local win_der_file der_file
+  win_der_file="$(powershell.exe -NoProfile -NonInteractive -Command "\$path = Join-Path \$env:TEMP ('learnalgorithm-avg-root-' + [guid]::NewGuid().ToString() + '.der'); Write-Output \$path" 2>/dev/null | tr -d '\r')"
+  [ -n "$win_der_file" ] || return 1
+
   if powershell.exe -NoProfile -NonInteractive -Command "\$cert = Get-ChildItem Cert:\\CurrentUser\\Root, Cert:\\LocalMachine\\Root -ErrorAction SilentlyContinue | Where-Object { \$_.Subject -like '*AVG Web/Mail Shield Root*' } | Select-Object -First 1; if (\$cert) { Export-Certificate -Cert \$cert -FilePath '$win_der_file' -Type CERT | Out-Null; exit 0 } exit 1" >/dev/null 2>&1; then
+    der_file="$(wslpath -u "$win_der_file" 2>/dev/null || true)"
     if [ -s "$der_file" ] && command -v openssl >/dev/null 2>&1; then
       openssl x509 -inform DER -in "$der_file" -out "$output_file" >/dev/null 2>&1
+      rm -f "$der_file" >/dev/null 2>&1 || true
       [ -s "$output_file" ]
       return
     fi
   fi
 
+  if [ -n "${der_file:-}" ]; then
+    rm -f "$der_file" >/dev/null 2>&1 || true
+  fi
   return 1
+}
+
+patch_source_controller_ca() {
+  local patch_file
+
+  if ! kubectl -n flux-system get deployment source-controller >/dev/null 2>&1; then
+    return 0
+  fi
+
+  patch_file="$(mktemp)"
+  cat >"$patch_file" <<EOF
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          env:
+            - name: SSL_CERT_FILE
+              value: /tmp/learnalgorithm-git-ca/ca.crt
+            - name: GIT_SSL_CAINFO
+              value: /tmp/learnalgorithm-git-ca/ca.crt
+          volumeMounts:
+            - name: learnalgorithm-git-ca
+              mountPath: /tmp/learnalgorithm-git-ca
+              readOnly: true
+      volumes:
+        - name: learnalgorithm-git-ca
+          secret:
+            secretName: $FLUX_GIT_CA_SECRET
+EOF
+
+  echo "Mounting Flux Git CA bundle into source-controller..."
+  kubectl -n flux-system patch deployment source-controller --type=strategic --patch-file "$patch_file" >/dev/null
+  rm -f "$patch_file" >/dev/null 2>&1 || true
+  kubectl -n flux-system rollout restart deploy/source-controller >/dev/null
+  kubectl -n flux-system rollout status deploy/source-controller --timeout=120s
 }
 
 create_flux_git_ca_secret() {
@@ -115,6 +165,7 @@ echo "Ensuring Flux and app namespaces exist..."
 kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f deploy/k8s/namespace.yaml
 create_flux_git_ca_secret
+patch_source_controller_ca
 
 if [ -z "$IMAGE_REGISTRY" ]; then
   echo "Building local images for GitOps-applied manifests..."

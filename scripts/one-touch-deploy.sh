@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# shellcheck source=scripts/load-env.sh
+source "$ROOT_DIR/scripts/load-env.sh"
+
 MODE="docker"
 EXTRA_ARGS=()
 while [ "$#" -gt 0 ]; do
@@ -36,10 +39,7 @@ echo "Detecting local environment..."
 "$ROOT_DIR/scripts/detect-env.sh"
 echo
 
-if [ ! -f ".env" ]; then
-  echo "Creating .env from .env.example"
-  cp .env.example .env
-fi
+load_project_env "$ROOT_DIR"
 
 case "$MODE" in
   docker)

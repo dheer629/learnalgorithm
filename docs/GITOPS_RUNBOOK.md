@@ -38,6 +38,8 @@ kubectl get svc -n learnalgorithm
 secret from the Linux CA bundle before applying Flux resources. On WSL, it also
 auto-detects the Windows `AVG Web/Mail Shield Root` certificate when present and
 adds it to the bundle so Flux can clone GitHub through local HTTPS inspection.
+The script mounts that bundle into `source-controller` and restarts the
+controller so the refreshed trust store is used for Git fetches.
 
 For another antivirus, proxy, or corporate root CA, export the root certificate
 as PEM and run:
@@ -45,6 +47,9 @@ as PEM and run:
 ```bash
 FLUX_GIT_CA_CERT=/path/to/local-root-ca.pem ./scripts/one-touch-deploy.sh --mode flux
 ```
+
+Use the same `FLUX_GIT_CA_CERT` fallback if WSL cannot execute Windows tools
+such as `powershell.exe`.
 
 To disable the AVG auto-detection:
 

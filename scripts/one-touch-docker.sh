@@ -4,21 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# shellcheck source=scripts/load-env.sh
+source "$ROOT_DIR/scripts/load-env.sh"
+
 ENV_FILE="deploy/docker/.env"
-if [ ! -f "$ENV_FILE" ]; then
-  echo "Creating $ENV_FILE from deploy/docker/.env.example"
-  cp deploy/docker/.env.example "$ENV_FILE"
-fi
-
-if [ ! -f ".env" ]; then
-  echo "Creating .env from .env.example"
-  cp .env.example .env
-fi
-
-set -a
-# shellcheck source=/dev/null
-source "$ENV_FILE"
-set +a
+ensure_env_file "$ENV_FILE" "deploy/docker/.env.example"
+load_project_env "$ROOT_DIR"
+load_env_file "$ENV_FILE"
 
 echo "Building and starting Algorithm Learn with Docker Compose..."
 echo "Image tag: ${IMAGE_TAG:-local}"

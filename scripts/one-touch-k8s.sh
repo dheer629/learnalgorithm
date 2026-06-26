@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# shellcheck source=scripts/load-env.sh
+source "$ROOT_DIR/scripts/load-env.sh"
+load_project_env "$ROOT_DIR"
+
 NAMESPACE="${NAMESPACE:-learnalgorithm}"
 IMAGE_TAG="${IMAGE_TAG:-local}"
 IMAGE_REGISTRY="${IMAGE_REGISTRY:-}"

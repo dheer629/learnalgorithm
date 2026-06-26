@@ -88,6 +88,21 @@ Common variables:
 - `ADMIN_TOKEN`
 - `PISTON_URL`
 
+The one-touch scripts load `.env` automatically and keep already-exported shell
+variables as overrides. For example, on a WSL machine with local TLS inspection:
+
+```bash
+PIP_TRUSTED_HOST_ARGS="--trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org" \
+  ./scripts/one-touch-deploy.sh --mode flux
+```
+
+For Flux Git fetches behind a local antivirus or proxy root CA, export that root
+as PEM and pass it without committing it:
+
+```bash
+FLUX_GIT_CA_CERT=/tmp/local-root-ca.pem ./scripts/one-touch-deploy.sh --mode flux
+```
+
 ## Images
 
 Local default:
